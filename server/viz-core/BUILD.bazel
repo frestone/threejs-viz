@@ -1,0 +1,271 @@
+# ---------------------------------------------------------------------------
+# viz-core:真实数据解码核心库(从 filament_mvp 迁移,剥离全部渲染代码)。
+#
+# 职责:读 decoder.json/s3.json -> 解析 MCAP(本地/S3 Range 流式) ->
+#       按 decoder 声明式规则归一化为 frame.proto 的 Frame/Dataset。
+# 不含任何 render/ 代码(server.cpp 与渲染完全解耦)。
+#
+# 第三方依赖替换(相对 filament_mvp):
+#   @filament//:zstd  -> 系统 -lzstd(MCAP chunk 解压)
+#   //:nlohmann_json  -> //server/third_party:nlohmann_json(vendored 单头)
+#   -lssl/-lcrypto    -> 系统 OpenSSL(SigV4 签名 + HTTPS/TLS)
+# ---------------------------------------------------------------------------
+package(default_visibility = ["//visibility:public"])
+
+# Windows(MSVC + vcpkg)平台选择点:hevc_decoder 的 FFmpeg 依赖在 Windows 上
+# 走 //server/third_party:ffmpeg_vcpkg(vcpkg 预编译静态库),而非 @ffmpeg
+# (rules_foreign_cc 的 configure_make,仅 Linux 可用)。
+config_setting(
+    name = "windows",
+    constraint_values = ["@platforms//os:windows"],
+)
+
+# ---------------------------------------------------------------------------
+# hevc_decoder:HEVC(H.265)相机码流 -> JPEG 解码器。
+# @ffmpeg 由 rules_foreign_cc 从 FFmpeg n6.1.1 源码 configure+make 静态编译
+# (见 //server/third_party:ffmpeg.BUILD),静态库链接进单体二进制,部署环境
+# 无需预装 FFmpeg 运行时库。
+# ---------------------------------------------------------------------------
+cc_library(
+    name = "jpeg_thumbnail",
+    srcs = ["src/image/jpeg_thumbnail.cpp"],
+    hdrs = ["include/viz/image/jpeg_thumbnail.h"],
+    includes = select({
+        # Windows 需 vcpkg include(jpeglib.h 来自 libjpeg-turbo);Linux 用系统头。
+        ":windows": [
+            "include",
+            "D:/vcpkg/installed/x64-windows-static-md/include",
+        ],
+        "//conditions:default": ["include"],
+    }),
+    copts = ["-std=c++17"],
+    linkopts = select({
+        ":windows": ["D:/vcpkg/installed/x64-windows-static-md/lib/jpeg.lib"],
+        "//conditions:default": ["-ljpeg"],
+    }),
+)
+
+cc_library(
+    name = "hevc_decoder",
+    srcs = ["src/image/hevc_decoder.cpp"],
+    hdrs = [
+        "include/viz/image/hevc_decoder.h",
+        # gop_index.h 提供 IsHevcIFrame:解码器在送包前判别 I 帧以正确置同步态
+        # (花屏修复),与 GOP 感知 seek 共用同一判别源,避免逻辑重复。
+        "src/session/gop_index.h",
+    ],
+    includes = [
+        "include",
+        "src",
+    ],
+    copts = ["-std=c++17"],
+    deps = select({
+        # @ffmpeg(rules_foreign_cc 源码编译)仅 Linux 可用;Windows 走 vcpkg 预编译库。
+        ":windows": [":jpeg_thumbnail", "//server/third_party:ffmpeg_vcpkg"],
+        "//conditions:default": [":jpeg_thumbnail", "@ffmpeg"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "viz-core",
+    srcs = [
+        "src/config/config.cpp",
+        "src/config/config_paths.cpp",
+        "src/config/profile_registry.cpp",
+        "src/data/data_source.cpp",
+        "src/data/mcap_reader.cpp",
+        "src/data/mcap_data_source.cpp",
+        "src/data/s3_client.cpp",
+        "src/data/meta_client.cpp",
+        "src/access/mcap_adapter.cpp",
+        "src/session/offline_session.cpp",
+    ],
+    hdrs = glob(["include/viz/*.h"]) + [
+        "include/viz/access/data_access_adapter.h",
+        "include/viz/transport/transport.h",
+        "include/viz/image/hevc_decoder.h",
+        "src/access/mcap_adapter.h",
+        "src/config/config_paths.h",
+        "src/config/profile_registry.h",
+        "src/session/offline_session.h",
+        "src/session/bigdata_frame.h",
+        "src/session/raw_data_defs_frame.h",
+        "src/session/bigdata_ring.h",
+        "src/session/gop_index.h",
+        "src/data/pb_wire.h",
+        "src/data/mcap_reader.h",
+        "src/data/random_reader.h",
+        "src/data/s3_client.h",
+        "src/data/meta_client.h",
+    ],
+    # include/:对外暴露 viz/*.h;src/:内部 data/*.h。
+    includes = [
+        "include",
+        "src",
+    ],
+    copts = ["-std=c++17"],
+    # ASIO_STANDALONE:standalone Asio 不依赖 Boost。
+    defines = ["ASIO_STANDALONE"],
+    # 系统库:zstd(MCAP 解压) + OpenSSL(SigV4/TLS)。
+    # Windows 走 vcpkg 静态库名(zstd.lib/libssl.lib/libcrypto.lib),Linux 用 -l 前缀。
+    linkopts = select({
+        ":windows": [
+            "D:/vcpkg/installed/x64-windows-static-md/lib/zstd.lib",
+            "D:/vcpkg/installed/x64-windows-static-md/lib/libssl.lib",
+            "D:/vcpkg/installed/x64-windows-static-md/lib/libcrypto.lib",
+        ],
+        "//conditions:default": ["-lzstd", "-lssl", "-lcrypto"],
+    }),
+    deps = [
+        "//server/viz-core/proto:frame_cc_proto",
+        "//server/third_party:nlohmann_json",
+        ":hevc_decoder",
+        "@websocketpp//:websocketpp",
+        "@asio",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ---------------------------------------------------------------------------
+# offline_session_fps_test:后端发帧速率(FPS)回归测试。
+# 用合成 FakeAdapter + 计数 CountingSink(定义在测试内),经 OfflineSession 的
+# 测试注入入口 OpenWithAdapter 驱动播放线程,断言实测发帧速率贴合目标
+# (帧间隔/倍速),守护任务B(播放性能/解码解耦)时序不回退。
+# 不依赖真实 MCAP/S3/FFmpeg,可离线快速运行。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "offline_session_fps_test",
+    srcs = ["test/offline_session_fps_test.cpp"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":viz-core",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# bigdata_frame_test:大数据独立流(type 11)封包字节布局回归测试。
+# 仅依赖纯 header bigdata_frame.h(inline EncodeBigDataFrame),不牵扯 viz-core
+# 重依赖(ffmpeg/mcap/ssl),断言封包与前端 messageCodec BIGDATA 严格字节级一致。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "bigdata_frame_test",
+    srcs = [
+        "test/bigdata_frame_test.cc",
+        "src/session/bigdata_frame.h",
+    ],
+    copts = ["-std=c++17"],
+    includes = ["src"],
+    deps = [
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# bigdata_ring_test:大数据后端有界环形缓冲(字节预算 LRU)单测。
+# 仅依赖纯 header bigdata_ring.h,不牵扯 viz-core 重依赖。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "bigdata_ring_test",
+    srcs = [
+        "test/bigdata_ring_test.cc",
+        "src/session/bigdata_ring.h",
+    ],
+    copts = ["-std=c++17"],
+    includes = ["src"],
+    deps = [
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# gop_index_test:HEVC GOP 感知 seek 的 I 帧起点定位单测。
+# 仅依赖纯 header gop_index.h,不牵扯 viz-core 重依赖。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "gop_index_test",
+    srcs = [
+        "test/gop_index_test.cc",
+        "src/session/gop_index.h",
+    ],
+   copts = ["-std=c++17"],
+    includes = ["src"],
+    deps = [
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "image_channel_config_test",
+    srcs = ["test/image_channel_config_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":viz-core",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "mcap_schema_test",
+    srcs = ["test/mcap_schema_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":viz-core",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# raw_data_defs_test:Task 2 RawData Definitions 建模纯函数单测。
+# 覆盖 BuildRawDataDefs:仅配置通道输出、topic->Channel->Schema 关联、schema 去重、
+# 缺 schema 通道 available=false 且 unavailableReason=="缺少 Schema"、按 schema id/
+# channel id 稳定排序、generation 透传。不依赖真实 MCAP/S3。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "raw_data_defs_test",
+    srcs = ["test/raw_data_defs_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":viz-core",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# raw_data_defs_frame_test:Task 3 type 12 ChannelDefs 封包字节布局单测。
+# 仅依赖纯 header raw_data_defs_frame.h(集中式 EncodeRawDataDefsFrame)+ transport.h/
+# config.h(标准库依赖)+ nlohmann_json,不牵扯 viz-core 重依赖(ffmpeg/mcap/ssl)。
+# 断言首字节=12、其后 UTF-8 JSON、外层 rawData/schemas、字段命名与 spec §6 一致。
+# ---------------------------------------------------------------------------
+cc_test(
+    name = "raw_data_defs_frame_test",
+    srcs = [
+        "test/raw_data_defs_frame_test.cc",
+        "src/session/raw_data_defs_frame.h",
+        "include/viz/transport/transport.h",
+        "include/viz/config.h",
+    ],
+    copts = ["-std=c++17"],
+    includes = [
+        "include",
+        "src",
+    ],
+    deps = [
+        "//server/third_party:nlohmann_json",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# JPEG 缩略重编码回归测试：覆盖非对齐源尺寸、目标尺寸与 RGB 通道正确性。
+cc_test(
+    name = "jpeg_thumbnail_test",
+    srcs = ["test/jpeg_thumbnail_test.cc"],
+    copts = ["-std=c++17"],
+    includes = ["include"],
+    linkopts = ["-ljpeg"],
+    deps = [
+        ":jpeg_thumbnail",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

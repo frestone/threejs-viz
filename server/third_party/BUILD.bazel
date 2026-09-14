@@ -1,0 +1,25 @@
+package(default_visibility = ["//visibility:public"])
+
+# vendored nlohmann/json 单头库(server.cpp / config.cpp / meta_client.cpp 使用)。
+cc_library(
+    name = "nlohmann_json",
+    hdrs = ["nlohmann/json.hpp"],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# Windows 专用:FFmpeg 静态库来自 vcpkg(x64-windows-static-md triplet,静态库/动态 CRT,
+# 与 Rust 默认 /MD 一致)。仅 hevc_decoder 在 Windows 上依赖本 target;Linux 仍走
+# @ffmpeg(rules_foreign_cc configure_make 源码编译)。
+# 依赖顺序(MSVC 无 --start-group,左到右解析):avcodec -> swscale -> swresample -> avutil。
+cc_library(
+    name = "ffmpeg_vcpkg",
+    includes = ["D:/vcpkg/installed/x64-windows-static-md/include"],
+    linkopts = [
+        "D:/vcpkg/installed/x64-windows-static-md/lib/avcodec.lib",
+        "D:/vcpkg/installed/x64-windows-static-md/lib/swscale.lib",
+        "D:/vcpkg/installed/x64-windows-static-md/lib/swresample.lib",
+        "D:/vcpkg/installed/x64-windows-static-md/lib/avutil.lib",
+    ],
+    visibility = ["//visibility:public"],
+)

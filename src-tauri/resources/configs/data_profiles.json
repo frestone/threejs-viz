@@ -1,0 +1,19 @@
+{
+  "_comment": "多原始 MCAP 数据 profile 注册表(A3b)。open 时按 MCAP topic 集合自动选 decoder。新增数据源只加一条 profile 即可，无需改代码。删除本文件则退化为内建高精/轻图规则。匹配语义: topics_all 全部命中 + topics_any 至少一个命中; 命中多个取 priority 最大者。",
+  "profiles": [
+    {
+      "name": "high_precision",
+      "decoder": "configs/decoder.json",
+      "priority": 100,
+      "topics_any": ["/localization/global_location"],
+      "topics_all": []
+    },
+    {
+      "name": "light_map",
+      "decoder": "configs/decoder_lightmap.json",
+      "priority": 90,
+      "topics_any": ["/map/lite_definition_map"],
+      "topics_all": []
+    }
+  ]
+}

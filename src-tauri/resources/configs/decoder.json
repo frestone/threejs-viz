@@ -1,0 +1,318 @@
+{
+  "decoder": {
+    "//": "两层解码配置。level1=geometries：声明基础几何图元及其构成属性；",
+    "//2": "level2=layers：每个图层选定一个几何类型，并给出从 protobuf tag 提取各属性的路径。",
+
+    "geometries": {
+      "point":     { "attributes": ["position"] },
+      "linestrip": { "attributes": ["points"] },
+      "box":       { "attributes": ["position", "size", "heading"] },
+      "polygon":   { "attributes": ["points", "height"] },
+      "text":      { "attributes": ["position", "content"] }
+    },
+
+    "//text": "TEXT 几何全局渲染参数。与 geometries.text 配合使用：解码器按 template + typeNames 生成每条 item.text；渲染层按 fontSize 把文字栅格化为线段顶点画到 3D 场景。color 形如 #RRGGBB。typeNames 把数字 type 映射到人读名称（默认按 1=VEHICLE / 2=PEDESTRIAN / 3=CYCLIST / 其它=UNKNOWN）。template 支持占位符 {id} {type} {typeName}。",
+    "text": {
+      "template": "{id} {typeName}",
+      "fontSize": 0.6,
+      "lineWidth": 0.04,
+      "heightOffset": 0.3,
+      "color": "#FFFFFF",
+      "typeNames": {
+        "1": "VEHICLE",
+        "2": "PEDESTRIAN",
+        "3": "CYCLIST",
+        "6": "POLYGON"
+      }
+    },
+
+    "layers": {
+      "localization": {
+        "topic": "/localization/global_location",
+        "geometry": "point",
+        "fields": {
+          "//": "ego 位姿。position 从 odometry.pose.position(Vector3) 取，heading 从 attitude.z 取。",
+          "//speed": "速度从 odometry.twist.linear(Vector3){x,y,z} 取真实线速度（取代前后帧位移差分）。",
+          "odometry": 2,
+          "pose": 3,
+          "position": 1,
+          "attitude": 3,
+          "twist": 4,
+          "linear": 1,
+          "vec3": { "x": 1, "y": 2, "z": 3 }
+        }
+      },
+
+      "planning_trajectory": {
+        "topic": "/planning/planning_result",
+        "frameId": "FRAME_MAP",
+        "geometry": "planning_trajectory",
+        "fields": {
+          "//": "规划轨迹折线。list=trajectory(7)，其内 repeated point(2)，点内 path_point(1){x,y}。",
+          "list": 7,
+          "point": 2,
+          "pathPoint": 1,
+          "x": 1,
+          "y": 2
+        }
+      },
+
+      "planning_path": {
+        "topic": "/planning/planning_result",
+        "frameId": "FRAME_MAP",
+        "geometry": "linestrip",
+        "fields": {
+          "//": "规划参考线折线。list=path(6)，其内 repeated point(2)，点直接是 {x,y}。",
+          "list": 6,
+          "point": 2,
+          "pathPoint": 1,
+          "x": 1,
+          "y": 2
+        }
+      },
+
+      "perception": {
+        "topic": "/perception/fused_track",
+        "frameId": "FRAME_MAP",
+        "geometry": "box",
+        "fields": {
+          "//": "感知障碍物。默认几何=box(position/size/heading)；当 type==polygonType 时改用 polygon 点集。",
+          "track": 3,
+          "specialTrack": 6,
+          "id": 3,
+          "score": 4,
+          "type": 6,
+          "position": 8,
+          "heading": 9,
+          "length": 10,
+          "width": 11,
+          "height": 12,
+          "polygon": 18,
+          "polyX": 1,
+          "polyY": 2,
+          "vec3": { "x": 1, "y": 2, "z": 3 },
+          "polygonType": 6
+        }
+      },
+
+      "prediction": {
+        "topic": "/prediction/prediction_result",
+        "frameId": "FRAME_MAP",
+        "fields": {
+          "//": "预测结果。同一消息拆两图层：prediction_box 取 tracked_obstacle 有向包围盒；prediction_trajectory 取 prediction_trajectory 预测轨迹折线。坐标系同 fused_track(FRAME_MAP)。",
+          "predObstacle": 3,
+          "id": 9,
+          "type": 10,
+          "trackedObstacle": 13,
+          "position": 1,
+          "length": 2,
+          "width": 3,
+          "height": 4,
+          "heading": 5,
+          "predTrajectory": 3,
+          "predTrajectoryPoint": 2,
+          "trajectoryPoint": 1,
+          "pathPoint": 1,
+          "x": 1,
+          "y": 2,
+          "vec3": { "x": 1, "y": 2, "z": 3 }
+        }
+      }
+    },
+
+    "signals": {
+      "//": "声明式信号取数：信号名直接对应源 mcap 消息字段。path 为该字段的 protobuf field-tag 序列（逐层下钻）。图表 series 的 yField 引用这里的信号名。",
+      "//path": "Localization.odometry(2).twist(4).linear(1).{x=1,y=2,z=3}",
+      "odometry.twist.linear.x": { "topic": "localization", "path": [2, 4, 1, 1] },
+      "odometry.twist.linear.y": { "topic": "localization", "path": [2, 4, 1, 2] },
+      "odometry.twist.linear.z": { "topic": "localization", "path": [2, 4, 1, 3] },
+      "//speed": "派生量：由上面两个源字段合成的合速度 sqrt(vx²+vy²)。",
+      "speed": { "expr": "hypot", "of": ["odometry.twist.linear.x", "odometry.twist.linear.y"] },
+
+      "//ctrl": "/control/control_cmd(message Control) 信号。topic=control，帧率与 localization 不同，组装帧时最近邻对齐。",
+      "//ctrlpath": "Control.throttle(3)/brake(4)/acceleration_target(5)/speed_target(7)/control_debug(10).lat_error(3)/lon_error(6)。",
+      "control.throttle":             { "topic": "control", "path": [3] },
+      "control.brake":               { "topic": "control", "path": [4] },
+      "control.acceleration_target":  { "topic": "control", "path": [5] },
+      "control.speed_target":         { "topic": "control", "path": [7] },
+      "control_debug.lat_error":      { "topic": "control", "path": [10, 3] },
+      "control_debug.lon_error":      { "topic": "control", "path": [10, 6] }
+    }
+  },
+
+  "//layers": "3D 图层渲染样式（与 decoder/signals/charts 平级，由 SceneConfig::fromJson 解析）。id=前端图层名；source=对齐 frame.layers 的 key（localization/trajectory/path/perception）；draw=line/ribbon/points/box/polygon；style.color 形如 #RRGGBB，height=离地抬升，width=线宽/box 尺寸，colorByType=按障碍物 type 着色，visible=初始可见。缺省本节点则后端回退内建 defaults()。",
+  "layers": [
+    {
+      "id": "localization",
+      "source": "localization",
+      "draw": "box",
+      "group": "ego", "groupLabel": "自车 / 定位", "label": "定位 / Ego 位姿",
+      "visible": true,
+      "style": { "color": "#33E5FF", "width": 4.6, "height": 1.5, "opacity": 1.0 }
+    },
+    {
+      "id": "trajectory",
+      "source": "trajectory",
+      "draw": "planning_trajectory",
+      "group": "planning", "groupLabel": "规划", "label": "规划轨迹",
+      "visible": true,
+      "style": { "color": "#4DFF80", "width": 1.0, "height": 0.1, "opacity": 1.0 }
+    },
+    {
+      "id": "path",
+      "source": "path",
+      "draw": "line",
+      "group": "planning", "groupLabel": "规划", "label": "规划参考线",
+      "visible": true,
+      "style": { "color": "#FFD84D", "width": 0.08, "height": 0.05, "opacity": 1.0 }
+    },
+    {
+      "id": "perception",
+      "source": "perception",
+      "draw": "box",
+      "group": "perception", "groupLabel": "感知", "label": "障碍物 / 感知",
+      "visible": true,
+      "style": { "color": "#FF6B6B", "colorByType": true, "opacity": 0.25 }
+    },
+    {
+      "id": "prediction_box",
+      "source": "prediction_box",
+      "draw": "box",
+      "group": "prediction", "groupLabel": "预测", "label": "预测障碍物 Box",
+      "visible": true,
+      "style": { "color": "#B36BFF", "colorByType": true, "opacity": 0.2 }
+    },
+    {
+      "id": "prediction_trajectory",
+      "source": "prediction_trajectory",
+      "draw": "line",
+      "group": "prediction", "groupLabel": "预测", "label": "预测轨迹",
+      "visible": true,
+      "style": { "color": "#B36BFF", "width": 0.1, "height": 0.1, "opacity": 0.8 }
+    }
+  ],
+
+  "//charts": "自定义图表(charts)由 SceneConfig 从本文件顶层 charts 数组解析（与 decoder/signals 平级）。图表 series 的 yField 引用 decoder.signals 声明的源字段名（如 odometry.twist.linear.x）或内建信号(t/ego.x/ego.y/ego.yaw/obstacle.count)。",
+  "charts": [
+    {
+      "id": "speed",
+      "title": "速度 (odometry.twist.linear)",
+      "xLabel": "t (s)",
+      "yLabel": "v (m/s)",
+      "visible": true,
+      "series": [       
+        { "name": "vx", "xField": "t", "yField": "odometry.twist.linear.x", "kind": "line", "color": "#ff6699" },
+        { "name": "vy", "xField": "t", "yField": "odometry.twist.linear.y", "kind": "line", "color": "#66ff99" }
+      ]
+    },
+    {
+      "id": "control_cmd",
+      "title": "控制量 (Control)",
+      "xLabel": "t (s)",
+      "yLabel": "value",
+      "visible": true,
+      "series": [
+        { "name": "throttle", "xField": "t", "yField": "control.throttle", "kind": "line", "color": "#ff9999" },
+        { "name": "brake", "xField": "t", "yField": "control.brake", "kind": "line", "color": "#99ccff" }
+      ]
+    },
+    {
+      "id": "acceleration_target",
+      "title": "加速目标 (acceleration_target)",
+      "xLabel": "t (s)",
+      "yLabel": "a (m/s^2)",
+      "visible": true,
+      "series": [
+        { "name": "acceleration_target", "xField": "t", "yField": "control.acceleration_target", "kind": "line", "color": "#99ff99" }
+      ]
+    },
+    {
+      "id": "speed_target",
+      "title": "速度目标 (speed_target)",
+      "xLabel": "t (s)",
+      "yLabel": "v (m/s)",
+      "visible": true,
+      "series": [
+        { "name": "speed_target", "xField": "t", "yField": "control.speed_target", "kind": "line", "color": "#ffcc99" }
+      ]
+    },
+    {
+      "id": "control_errors",
+      "title": "控制误差 (control_debug)",
+      "xLabel": "t (s)",
+      "yLabel": "error (m)",
+      "visible": true,
+      "series": [
+        { "name": "lat_error", "xField": "t", "yField": "control_debug.lat_error", "kind": "line", "color": "#ff9966" },
+        { "name": "lon_error", "xField": "t", "yField": "control_debug.lon_error", "kind": "line", "color": "#6699ff" }
+      ]
+    }
+  ],
+
+  "//pointClouds": "点云图层配置。默认空数组=不订阅/不解码任何点云 topic(零成本)。启用时按结构声明: id/topic/listPath/xTag/yTag/zTag/intensityTag/pointSize/color/colorMode。",
+  "pointClouds": [],
+
+  "//imageChannels": "相机图像通道配置。默认空数组=不订阅/不解码任何图像(零成本)。前端订阅后后端按 topic 读消息并按 codec 解码(hevc→JPEG)填入 frame.images[id]。字段: id(=images key)/topic/codec/label。",
+  "imageChannels": [
+    {
+      "id": "camera360_front",
+      "topic": "/drivers/camera/camera360_front_image_hevc",
+      "codec": "hevc",
+      "label": "前视相机"
+    },
+    {
+      "id": "camera360_front_left",
+      "topic": "/drivers/camera/camera360_front_left_image_hevc",
+      "codec": "hevc",
+      "label": "左前相机"
+    },
+    {
+      "id": "camera360_front_right",
+      "topic": "/drivers/camera/camera360_front_right_image_hevc",
+      "codec": "hevc",
+      "label": "右前相机"
+    },
+    {
+      "id": "camera360_front_tele",
+      "topic": "/drivers/camera/camera360_front_tele_image_hevc",
+      "codec": "hevc",
+      "label": "前视长焦"
+    },
+    {
+      "id": "camera360_rear",
+      "topic": "/drivers/camera/camera360_rear_image_hevc",
+      "codec": "hevc",
+      "label": "后视相机"
+    },
+    {
+      "id": "camera360_rear_left",
+      "topic": "/drivers/camera/camera360_rear_left_image_hevc",
+      "codec": "hevc",
+      "label": "左后相机"
+    },
+    {
+      "id": "camera360_rear_right",
+      "topic": "/drivers/camera/camera360_rear_right_image_hevc",
+      "codec": "hevc",
+      "label": "右后相机"
+    },
+    {
+      "id": "monitor_front",
+      "topic": "/drivers/camera/monitor_front_image_hevc",
+      "codec": "hevc",
+      "label": "监控前"
+    },
+    {
+      "id": "monitor_left",
+      "topic": "/drivers/camera/monitor_left_image_hevc",
+      "codec": "hevc",
+      "label": "监控左"
+    },
+    {
+      "id": "monitor_right",
+      "topic": "/drivers/camera/monitor_right_image_hevc",
+      "codec": "hevc",
+      "label": "监控右"
+    }
+  ]
+}

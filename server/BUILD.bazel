@@ -1,0 +1,26 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# ---------------------------------------------------------------------------
+# threejs-viz 真实数据 WebSocket 后端。
+#
+# 复用 filament_mvp 的 platform/web/server.cpp:websocketpp + asio 回放服务,
+# 从 decoder.json 驱动解码 MCAP(本地/S3)为 frame.proto 帧并推送给前端。
+# 全部数据解码逻辑在 //server/viz-core,server.cpp 仅做 WS 会话/回放调度。
+#
+# 运行需工作目录含 configs/decoder.json 与 configs/s3.json(见 server/configs)。
+# ---------------------------------------------------------------------------
+cc_binary(
+    name = "viz_backend",
+    srcs = ["platform/web/server.cpp"],
+    copts = ["-std=c++17"],
+    deps = [
+        "//server/viz-core",
+        "//server/viz-core/proto:frame_cc_proto",
+        "//server/third_party:nlohmann_json",
+        "@websocketpp//:websocketpp",
+        "@asio",
+    ],
+    linkopts = ["-lpthread"],
+)

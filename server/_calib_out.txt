@@ -1,0 +1,49 @@
+==== mcap_data_reader.cpp ====
+27:McapDataReader::McapDataReader(const std::string& file_name) : DataReader(file_name) {
+28:  mcap_reader_ = std::make_unique<::jdx::rover::x2::RecordReader>(file_name);
+30:    WriteRunLog(DEF_LOG_WARN, "GetRecordInfo failed, file_name: %s ", file_name.c_str());
+544:  const std::string& file_name = record_detail_info->record_info.file_name;
+545:  for (const auto& attachment : record_info_.attachments()) {
+547:    WriteRunLog(DEF_LOG_INFO, "GetAttachment:%s", attachment.c_str());
+548:    if (attachment.find("sensor_calib_param.conf") != attachment.npos) {
+549:      auto status = mcap_reader_->GetAttachment(attachment, &data);
+551:        ParseCalibrateConf(data, file_name, &record_detail_info->calibration_param);
+552:        WriteRunLog(DEF_LOG_INFO, "GetAttachment %s success", attachment.c_str());
+554:        WriteRunLog(DEF_LOG_WARN, "GetAttachment %s failed", attachment.c_str());
+556:    } else if (attachment.find("vehicle_config.pb.txt") != attachment.npos) {
+557:      auto status = mcap_reader_->GetAttachment(attachment, &data);
+559:        ParseVehicleConfig(data, file_name, &record_detail_info->vehicle_config);
+560:        WriteRunLog(DEF_LOG_INFO, "GetAttachment %s success", attachment.c_str());
+562:        WriteRunLog(DEF_LOG_WARN, "GetAttachment %s failed", attachment.c_str());
+566:  WriteRunLog(DEF_LOG_INFO, "get_meta_info parse_attachment success filename=%s",
+567:              file_name.c_str());
+568:  WriteRunLog(DEF_LOG_INFO, "GetRecordDetailInfo success, file_name: %s", file_name.c_str());
+==== s3_mcap_data_reader.cpp ====
+38:    : DataReader(config.object_key) {  // 使用object_key作为file_name的替代
+631:  const std::string& file_name = record_detail_info->record_info.file_name;
+632:  for (const auto& attachment : record_info_.attachments()) {
+634:    if (attachment.find("sensor_calib_param.conf") != attachment.npos) {
+635:      auto status = s3_mcap_reader_->GetAttachment(attachment, &data);
+637:        ParseCalibrateConf(data, file_name, &record_detail_info->calibration_param);
+638:        WriteRunLog(DEF_LOG_INFO, "GetAttachment %s success", attachment.c_str());
+640:        WriteRunLog(DEF_LOG_WARN, "GetAttachment %s failed", attachment.c_str());
+642:    } else if (attachment.find("vehicle_config.pb.txt") != attachment.npos) {
+643:      auto status = s3_mcap_reader_->GetAttachment(attachment, &data);
+645:        ParseVehicleConfig(data, file_name, &record_detail_info->vehicle_config);
+646:        WriteRunLog(DEF_LOG_INFO, "GetAttachment %s success", attachment.c_str());
+648:        WriteRunLog(DEF_LOG_WARN, "GetAttachment %s failed", attachment.c_str());
+652:  WriteRunLog(DEF_LOG_INFO, "get_meta_info parse_attachment success filename=%s",
+653:              file_name.c_str());
+654:  WriteRunLog(DEF_LOG_INFO, "GetRecordDetailInfo success, file_name: %s", file_name_.c_str());
+==== record_data_reader.cpp ====
+24:RecordDataReader::RecordDataReader(const std::string& file_name) : DataReader(file_name) {
+25:  record_data_reader_ = std::make_unique<RecordReader>(file_name);
+27:    WriteRunLog(DEF_LOG_WARN, "GetRecordInfo failed, file_name: %s ", file_name.c_str());
+297:  WriteRunLog(DEF_LOG_INFO, " Total Message:  %d,filename %s", total_num, file_name_.c_str());
+487:    const std::string& file_name = record_detail_info->record_info.file_name;
+491:      if (it.first.find("sensor_calib_param.conf") != it.first.npos) {
+493:        ParseCalibrateConf(data, file_name, &record_detail_info->calibration_param);
+496:        ParseVehicleConfig(data, file_name, &record_detail_info->vehicle_config);
+500:    WriteRunLog(DEF_LOG_WARN, "Failed to get record header %s", file_name_.c_str());
+502:  WriteRunLog(DEF_LOG_INFO, "GetRecordDetailInfo success, file_name: %s", file_name_.c_str());
+==END==

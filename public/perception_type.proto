@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package jdx.rover.perception.proto;
+
+enum Type {
+  MISC = 0;
+  CAR = 1;
+  PEDESTRIAN = 2;
+  CYCLIST = 3;
+  TRUCK = 4;
+  BUS = 5;
+  // point cloud cluster type uses the polygon rather than rectangle bounding box to represent object
+  POINT_CLOUD_CLUSTER = 6;
+  ARTIFICIAL_VARIABLE_OBJECT = 7;
+  TRAFFIC_CONE = 8;
+  LOW_PROFILE_OBSTACLE = 9;
+  ROAD_SEWER = 10;
+  STATIC_NON_MOTOR = 11;
+  WATER_BARRIER = 12;
+  TRICYCLE = 13;
+  CYCLIST_STOPPED = 14;
+  POLE = 15;
+  JD_VEHICLE = 16;
+  OTHERS_VEHICLE = 17;
+  IMAGE_OCC = 18;
+  ALL = 19;
+  ROAD_CURB = 20;
+}

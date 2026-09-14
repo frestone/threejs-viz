@@ -1,0 +1,94 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# ---------------------------------------------------------------------------
+# viz_ffi:桌面(Tauri)进程内直连传输的 C ABI(见 ADR-08 双部署双路径)。
+#
+# 与 //server:viz_backend(WebSocket 形态)并列复用同一 //server/viz-core 核心库:
+#   * viz_backend : platform/web/server.cpp,WsTransport 实现 IFrameSink,WS 下发
+#   * viz_ffi     : platform/ffi/viz_ffi.cpp,FfiSink 实现 IFrameSink,C 回调直连
+# 两者的下行帧/JSON 封包字节完全一致(单一 frame.proto 契约),前端解析共用。
+#
+# 桌面同进程直连:Tauri(src-tauri)通过 Rust build.rs 静态链接 viz_ffi_lib(.a)
+# 进 Tauri 可执行二进制(而非产出 libviz_ffi.so + dlopen)。进程内直连本就同进程,
+# 可执行文件近距寻址,不触发 ld.gold 对 FFmpeg HEVC 大常量表的 R_X86_64_PC32 overflow
+# (WS 的 viz_backend 与本包 contract_test 均为可执行形态,一直正常)。
+# ---------------------------------------------------------------------------
+
+# C ABI 实现的静态库(便于测试直接链接,也作为共享库的输入)。
+cc_library(
+    name = "viz_ffi_lib",
+    srcs = ["viz_ffi.cpp"],
+    hdrs = ["viz_ffi.h"],
+    # includes 使 #include "platform/ffi/viz_ffi.h" 从 server/ 根解析。
+    includes = ["../.."],
+    copts = ["-std=c++17"],
+    deps = [
+        "//server/viz-core",
+        "//server/viz-core/proto:frame_cc_proto",
+        "//server/third_party:nlohmann_json",
+    ],
+    alwayslink = True,
+)
+
+# ---------------------------------------------------------------------------
+# viz_ffi_archive:把 viz_ffi_lib 及其全部传递依赖(viz-core / hevc_decoder /
+# frame proto / FFmpeg 三个 .a / protobuf / absl / zlib)聚合成【单个】静态归档。
+#
+# 背景:Bazel 默认只为 cc_library 物化 .so(dynamic),分析图里声明的各中间 .a
+# 执行阶段并不落盘,导致 build.rs 按 cquery 的 .a 路径链接时几乎全部“文件不存在”。
+# cc_static_library(Bazel 7.4,--experimental_cc_static_library 启用)会强制
+# 物化并归档所有传递静态库为一个 lib<name>.a,Rust build.rs 直接静态链接它即可,
+# 无需再逐个拼 76 个分散路径,也规避 .so 下 FFmpeg 大常量表的 PC32 overflow。
+# ---------------------------------------------------------------------------
+cc_static_library(
+    name = "viz_ffi_archive",
+    deps = [":viz_ffi_lib"],
+)
+
+# 打包静态库策略:桌面 FFI 走“Rust 静态链接进 Tauri 可执行二进制”。
+# 本包对外暴露 viz_ffi_lib(cc_library,alwayslink)作为链接目标——P1-6 阶段
+# Tauri 的 Rust build.rs 会把它连同传递依赖(viz-core / frame proto / FFmpeg
+# libavcodec.a·libswscale.a·libavutil.a / nlohmann_json)一并静态链接。
+#
+# 为何不产出 libviz_ffi.so:裁剪版 FFmpeg(--disable-x86asm 纯 C)的 libavcodec.a/
+# libswscale.a 内部大常量表(ff_h264_cabac_tables / ff_M24A / ff_w1111)在 small code
+# model 下用 R_X86_64_PC32 PC 相对寻址;塞进单个 .so 时 ld.gold 一律判 "may overflow
+# at runtime" 拒绝(还触发 gold internal error),而 ld.bfd 不认 --start-lib、本机无
+# lld;-mcmodel=large 经实测既未消除 overflow 又触发 gold 内部错误。可执行文件形态
+# 近距寻址无此问题(WS viz_backend 与 contract_test 均为例证),故桌面 FFI 走静态
+# 链接可执行二进制,不再产出 .so。(Bazel 7.4 的 cc_static_library 仍属实验特性,
+# 聚合归档留待 P1-6 在 Rust 侧或升级 Bazel 8 后处理。)
+
+# ---------------------------------------------------------------------------
+# viz_ffi_contract_test:契约一致性单元测试(P1-9)。
+# 用合成会话经 C ABI 触发下行回调,断言封包首字节类型与布局符合契约
+# (帧类 type||seq(u64 LE)||proto;JSON 类 type||json),与 WsTransport 逐字节对齐。
+# 不依赖真实 MCAP/S3/FFmpeg。
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ffi_smoke:桌面 FFI 路径 headless 冒烟驱动(非测试,不入 bazel test 集)。
+# 直接以 C ABI 打开真实 MCAP,在任意 cwd 下验证配置解析与帧内容;
+# 详见 ffi_smoke_main.cpp 文件头。
+# ---------------------------------------------------------------------------
+cc_binary(
+    name = "ffi_smoke",
+    srcs = ["ffi_smoke_main.cpp"],
+    includes = ["../.."],
+    copts = ["-std=c++17"],
+    deps = [":viz_ffi_lib"],
+)
+
+cc_test(
+    name = "viz_ffi_contract_test",
+    srcs = ["viz_ffi_contract_test.cpp"],
+    includes = ["../.."],
+    copts = ["-std=c++17"],
+    deps = [
+        ":viz_ffi_lib",
+        "//server/viz-core",
+        "//server/viz-core/proto:frame_cc_proto",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

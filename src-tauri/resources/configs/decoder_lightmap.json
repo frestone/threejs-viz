@@ -1,0 +1,450 @@
+{
+  "//": "轻图(LightMap)模式解码配置。与 decoder.json 结构一致，额外增加 decoder.light_map",
+  "//2": "静态地图解码块 + lane/boundary 渲染图层。主车定位复用 localization 块（odometry",
+  "//3": "结构与高精一致），实际订阅 topic 由后端 Topics 决定：轻图定位走 odometry_location。",
+  "//topics": "需求2：topic 名从本 json 读取（不硬编码）。轻图定位走 localizationLightMap，",
+  "//topics2": "静态地图走 lightMap。用顶层扁平键声明（图层名 localization 与 t.localization 冲突，故用扁平键）。",
+  "localizationLightMap": "/localization/odometry_location",
+  "//ldmapLocation": "轻图 Local 系主车定位，用于构造 Local->Odom 静态地图变换（与 odometry_location 首帧配对）。",
+  "ldmapLocation": "/localization/ldmap_location",
+  "//planning": "规划结果 topic，trajectory/path 同源；后端已解码到 planByTime，前端需在 layers 数组补 trajectory/path 图层。",
+  "planning": "/planning/planning_result",
+  "perception": "/perception/fused_track",
+  "lightMap": "/map/lite_definition_map",
+  "decoder": {
+    "geometries": {
+      "point":     {"attributes": ["position"] },
+      "linestrip": { "attributes": ["points"] },
+      "box":       { "attributes": ["position", "size", "heading"] },
+      "polygon":   { "attributes": ["points", "height"] },
+      "text":      { "attributes": ["position", "content"] }
+    },
+
+    "layers": {
+      "localization": {
+        "geometry": "point",
+        "frameId": "FRAME_ODOM",
+        "fields": {
+          "//": "轻图主车定位 OdomFusion.odometry(2).pose(3).position/attitude，与高精一致。",
+          "odometry": 2,
+          "pose": 3,
+          "position": 1,
+          "attitude": 3,
+          "twist": 4,
+          "linear": 1,
+          "vec3": { "x": 1, "y": 2, "z": 3 }
+        }
+      },
+      "perception": {
+        "geometry": "box",
+        "frameId": "FRAME_LIDAR_MASTER"
+      },
+
+      "//planning": "轻图 planning 与高精同源同结构；planning_result 本身 ODOM 系，assembleFrame 仅减 origin。",
+      "planning_trajectory": {
+        "topic": "/planning/planning_result",
+        "frameId": "FRAME_ODOM",
+        "geometry": "planning_trajectory",
+        "fields": { "list": 7, "point": 2, "pathPoint": 1, "x": 1, "y": 2 }
+      },
+      "planning_path": {
+        "topic": "/planning/planning_result",
+        "frameId": "FRAME_ODOM",
+        "geometry": "linestrip",
+        "fields": { "list": 6, "point": 2, "pathPoint": 1, "x": 1, "y": 2 }
+      },
+
+      "prediction": {
+        "topic": "/prediction/prediction_result",
+        "frameId": "FRAME_LIDAR_MASTER",
+        "fields": {
+          "//": "预测结果，轻图 FRAME_LIDAR_MASTER 车体相对系（同 fused_track），assembleFrame 走 LidarMaster->BaseLink->ODOM 变换后减 origin。拆两图层：prediction_box 取 tracked_obstacle；prediction_trajectory 取 prediction_trajectory 折线。",
+          "predObstacle": 3,
+          "id": 9,
+          "type": 10,
+          "trackedObstacle": 13,
+          "position": 1,
+          "length": 2,
+          "width": 3,
+          "height": 4,
+          "heading": 5,
+          "predTrajectory": 3,
+          "predTrajectoryPoint": 2,
+          "trajectoryPoint": 1,
+          "pathPoint": 1,
+          "x": 1,
+          "y": 2,
+          "vec3": { "x": 1, "y": 2, "z": 3 }
+        }
+      }
+    },
+
+    "//light_map": "轻图静态地图解码方式（独立配置，不硬编码）。enabled=true 后端才订阅",
+    "//light_map2": "/map/lite_definition_map。字段号对应 LocalMapMessage(map=3) -> hdmap::Map",
+    "//light_map3": "(lane=4 -> center_line=3；boundary=17 -> polyline=2, type=3) -> Polyline",
+    "//light_map4": "(vertex=1) -> Point(x=1,y=2,z=3)。boundaryTypeBuckets 按 type 枚举分桶到",
+    "//light_map5": "不同图层名后缀：图层名为 <boundaryLayerName>_<suffix>，命中桶才加后缀。",
+    "light_map": {
+      "enabled": true,
+      "topic": "/map/lite_definition_map",
+      "frameId": "FRAME_MAP",
+      "fields": {
+        "mapField": 3,
+        "laneField": 4,
+        "laneCenterField": 3,
+        "boundaryField": 17,
+        "boundaryPolylineField": 2,
+        "boundaryTypeField": 3,
+        "polylineVertexField": 1,
+        "pointXField": 1,
+        "pointYField": 2,
+        "pointZField": 3
+      },
+      "laneLayerName": "lane_center_line",
+      "boundaryLayerName": "boundary",
+      "//boundaryTypeBuckets": "Boundary.type: 1/2=DASHED 3/4=SOLID 7=CURB 8=BARRIER 10=GREENBELT",
+      "boundaryTypeBuckets": {
+        "1": "dashed",
+        "2": "dashed",
+        "3": "solid",
+        "4": "solid",
+        "5": "solid",
+        "6": "solid",
+        "7": "curb",
+        "8": "curb",
+        "10": "greenbelt"
+      },
+      "//mapLayers": "通用 map layer 表：覆盖 hdmap::Map 十多个 layer。field=Map子字段号，geomField=子消息几何字段号，geomKind=polyline/polygon。",
+      "mapLayers": [
+        { "field": 2,  "geomField": 2, "geomKind": "polyline", "layerName": "road" },
+        { "field": 4,  "geomField": 3, "geomKind": "polyline", "layerName": "lane_center_line" },
+        { "field": 6,  "geomField": 2, "geomKind": "polygon",  "layerName": "crosswalk" },
+        { "field": 7,  "geomField": 2, "geomKind": "polyline", "layerName": "stop_line" },
+        { "field": 9,  "geomField": 2, "geomKind": "polygon",  "layerName": "clear_area" },
+        { "field": 10, "geomField": 2, "geomKind": "polygon",  "layerName": "speed_bump" },
+        { "field": 11, "geomField": 2, "geomKind": "polygon",  "layerName": "parking" },
+        { "field": 3,  "geomField": 2,  "geomKind": "polygon",  "layerName": "intersection" },
+        { "field": 8,  "geomField": 12, "geomKind": "polygon",  "layerName": "signal" },
+        { "field": 12, "geomField": 2,  "geomKind": "polyline", "layerName": "gate" },
+        { "field": 13, "geomField": 2,  "geomKind": "polygon",  "layerName": "pillar" },
+        { "field": 14, "geomField": 2,  "geomKind": "polygon",  "layerName": "free_area" },
+        { "field": 15, "geomField": 2,  "geomKind": "polygon",  "layerName": "safety_island" },
+        { "field": 16, "geomField": 2,  "geomKind": "polygon",  "layerName": "prohibited_area" },
+        { "field": 17, "geomField": 2, "geomKind": "polyline", "layerName": "boundary", "typeField": 3,
+          "typeBuckets": { "1": "dashed", "2": "dashed", "3": "solid", "4": "solid", "5": "solid", "6": "solid", "7": "curb", "8": "curb", "10": "greenbelt" } },
+        { "field": 19, "geomField": 4, "geomKind": "polygon",  "layerName": "arow" }
+      ]
+    },
+
+    "signals": {
+      "odometry.twist.linear.x": { "topic": "localization", "path": [2, 4, 1, 1] },
+      "odometry.twist.linear.y": { "topic": "localization", "path": [2, 4, 1, 2] },
+      "odometry.twist.linear.z": { "topic": "localization", "path": [2, 4, 1, 3] },
+      "speed": { "expr": "hypot", "of": ["odometry.twist.linear.x", "odometry.twist.linear.y"] }
+    }
+  },
+
+  "//layers": "3D 图层渲染样式。localization=主车 box；lane_center_line=车道中心线；",
+  "//layers2": "boundary_* 为按 type 分桶的边界线（source 需与后端 parseLightMap 产出的图层名一致）。",
+  "layers": [
+    {
+      "id": "localization",
+      "source": "localization",
+      "draw": "box",
+      "group": "ego", "groupLabel": "自车 / 定位", "label": "定位 / Ego 位姿",
+      "visible": true,
+      "style": { "color": "#33E5FF", "width": 4.6, "height": 1.5, "opacity": 1.0 }
+    },
+    {
+      "id": "trajectory",
+      "source": "trajectory",
+      "draw": "planning_trajectory",
+      "group": "planning", "groupLabel": "规划", "label": "规划轨迹",
+      "visible": true,
+      "style": { "color": "#4DFF80", "width": 1.0, "height": 0.1, "opacity": 1.0 }
+    },
+    {
+      "id": "path",
+      "source": "path",
+      "draw": "line",
+      "group": "planning", "groupLabel": "规划", "label": "规划参考线",
+      "visible": true,
+      "style": { "color": "#FFD84D", "width": 0.08, "height": 0.05, "opacity": 1.0 }
+    },
+    {
+      "id": "perception",
+      "source": "perception",
+      "draw": "box",
+      "group": "perception", "groupLabel": "感知", "label": "障碍物 / 感知",
+      "visible": true,
+      "style": { "color": "#FF6B6B", "colorByType": true, "opacity": 0.25 }
+    },
+    {
+      "id": "prediction_box",
+      "source": "prediction_box",
+      "draw": "box",
+      "group": "prediction", "groupLabel": "预测", "label": "预测障碍物 Box",
+      "visible": true,
+      "style": { "color": "#B36BFF", "colorByType": true, "opacity": 0.2 }
+    },
+    {
+      "id": "prediction_trajectory",
+      "source": "prediction_trajectory",
+      "draw": "line",
+      "group": "prediction", "groupLabel": "预测", "label": "预测轨迹",
+      "visible": true,
+      "style": { "color": "#FFEB00", "width": 0.1, "height": 0.35, "opacity": 1.0 }
+    },
+    {
+      "id": "lane_center_line",
+      "source": "lane_center_line",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "车道中心线",
+      "visible": true,
+      "style": { "color": "#8888FF", "width": 0.08, "height": 0.02, "opacity": 0.8 }
+    },
+    {
+      "id": "boundary_solid",
+      "source": "boundary_solid",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "边界线",
+      "visible": true,
+      "style": { "color": "#FFFFFF", "width": 0.1, "height": 0.03, "opacity": 0.9 }
+    },
+    {
+      "id": "boundary_dashed",
+      "source": "boundary_dashed",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "边界线",
+      "visible": true,
+      "style": { "color": "#CCCCCC", "width": 0.08, "height": 0.03, "opacity": 0.7 }
+    },
+    {
+      "id": "boundary_curb",
+      "source": "boundary_curb",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "边界线",
+      "visible": true,
+      "style": { "color": "#FFAA33", "width": 0.12, "height": 0.05, "opacity": 0.9 }
+    },
+    {
+      "id": "boundary_greenbelt",
+      "source": "boundary_greenbelt",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "边界线",
+      "visible": true,
+      "style": { "color": "#33CC66", "width": 0.12, "height": 0.05, "opacity": 0.8 }
+    },
+    {
+      "id": "boundary",
+      "source": "boundary",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "边界线",
+      "visible": true,
+      "style": { "color": "#AAAAAA", "width": 0.08, "height": 0.02, "opacity": 0.7 }
+    },
+    {
+      "id": "road",
+      "source": "road",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "道路",
+      "visible": true,
+      "style": { "color": "#555577", "width": 0.06, "height": 0.01, "opacity": 0.5 }
+    },
+    {
+      "id": "stop_line",
+      "source": "stop_line",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "停止线",
+      "visible": true,
+      "style": { "color": "#FF3355", "width": 0.2, "height": 0.03, "opacity": 0.9 }
+    },
+    {
+      "id": "crosswalk",
+      "source": "crosswalk",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "人行横道",
+      "visible": true,
+      "style": { "color": "#EEEEEE", "width": 0.12, "height": 0.02, "opacity": 0.85 }
+    },
+    {
+      "id": "clear_area",
+      "source": "clear_area",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "禁停区",
+      "visible": true,
+      "style": { "color": "#FFCC00", "width": 0.1, "height": 0.02, "opacity": 0.7 }
+    },
+    {
+      "id": "speed_bump",
+      "source": "speed_bump",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "减速带",
+      "visible": true,
+      "style": { "color": "#FF8800", "width": 0.15, "height": 0.04, "opacity": 0.85 }
+    },
+    {
+      "id": "parking",
+      "source": "parking",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "停车位",
+      "visible": true,
+      "style": { "color": "#66CCFF", "width": 0.08, "height": 0.02, "opacity": 0.7 }
+    },
+    {
+      "id": "arow",
+      "source": "arow",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "箭头",
+      "visible": true,
+      "style": { "color": "#FFFFAA", "width": 0.1, "height": 0.03, "opacity": 0.9 }
+    },
+    {
+      "id": "intersection",
+      "source": "intersection",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "路口",
+      "visible": true,
+      "style": { "color": "#7744AA", "width": 0.08, "height": 0.01, "opacity": 0.4 }
+    },
+    {
+      "id": "signal",
+      "source": "signal",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "信号灯",
+      "visible": true,
+      "style": { "color": "#FF5533", "width": 0.1, "height": 0.05, "opacity": 0.9 }
+    },
+    {
+      "id": "gate",
+      "source": "gate",
+      "draw": "line",
+      "group": "map", "groupLabel": "地图图层", "label": "闸机/门",
+      "visible": true,
+      "style": { "color": "#FF9933", "width": 0.15, "height": 0.05, "opacity": 0.9 }
+    },
+    {
+      "id": "pillar",
+      "source": "pillar",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "立柱",
+      "visible": true,
+      "style": { "color": "#999999", "width": 0.1, "height": 0.1, "opacity": 0.8 }
+    },
+    {
+      "id": "free_area",
+      "source": "free_area",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "自由通行区",
+      "visible": true,
+      "style": { "color": "#44AA88", "width": 0.08, "height": 0.01, "opacity": 0.4 }
+    },
+    {
+      "id": "safety_island",
+      "source": "safety_island",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "安全岛",
+      "visible": true,
+      "style": { "color": "#33CCAA", "width": 0.1, "height": 0.03, "opacity": 0.6 }
+    },
+    {
+      "id": "prohibited_area",
+      "source": "prohibited_area",
+      "draw": "polygon",
+      "group": "map", "groupLabel": "地图图层", "label": "禁行区",
+      "visible": true,
+      "style": { "color": "#CC4466", "width": 0.1, "height": 0.02, "opacity": 0.6 }
+    }
+  ],
+
+  "charts": [
+    {
+      "id": "speed",
+      "title": "速度 (odometry.twist.linear)",
+      "xLabel": "t (s)",
+      "yLabel": "v (m/s)",
+      "visible": true,
+      "series": [
+        { "name": "vx", "xField": "t", "yField": "odometry.twist.linear.x", "kind": "line", "color": "#ff6699" },
+        { "name": "vy", "xField": "t", "yField": "odometry.twist.linear.y", "kind": "line", "color": "#66ff99" }
+      ]
+    }
+  ],
+
+  "//pointClouds": "点云图层配置。每项声明一个点云通道如何从 MCAP topic 提取 + 前端渲染样式。默认空数组=不订阅/不解码任何点云 topic(零成本)。示例结构见下方注释项。",
+  "//pointCloudsExample": {
+    "id": "lidar",
+    "topic": "/perception/lidar_points",
+    "messageType": "",
+    "visible": true,
+    "listPath": "8",
+    "xTag": 1, "yTag": 2, "zTag": 3, "intensityTag": 4,
+    "pointSize": 0.05,
+    "color": "#B3E5FC",
+    "colorMode": "intensity",
+    "frameId": "ego"
+  },
+  "pointClouds": [],
+  "imageChannels": [
+    {
+      "id": "camera360_front",
+      "topic": "/drivers/camera/camera360_front_image_hevc",
+      "codec": "hevc",
+      "label": "前视相机"
+    },
+    {
+      "id": "camera360_front_left",
+      "topic": "/drivers/camera/camera360_front_left_image_hevc",
+      "codec": "hevc",
+      "label": "左前相机"
+    },
+    {
+      "id": "camera360_front_right",
+      "topic": "/drivers/camera/camera360_front_right_image_hevc",
+      "codec": "hevc",
+      "label": "右前相机"
+    },
+    {
+      "id": "camera360_front_tele",
+      "topic": "/drivers/camera/camera360_front_tele_image_hevc",
+      "codec": "hevc",
+      "label": "前视长焦"
+    },
+    {
+      "id": "camera360_rear",
+      "topic": "/drivers/camera/camera360_rear_image_hevc",
+      "codec": "hevc",
+      "label": "后视相机"
+    },
+    {
+      "id": "camera360_rear_left",
+      "topic": "/drivers/camera/camera360_rear_left_image_hevc",
+      "codec": "hevc",
+      "label": "左后相机"
+    },
+    {
+      "id": "camera360_rear_right",
+      "topic": "/drivers/camera/camera360_rear_right_image_hevc",
+      "codec":"hevc",
+      "label": "右后相机"
+    },
+    {
+      "id": "monitor_front",
+      "topic": "/drivers/camera/monitor_front_image_hevc",
+      "codec": "hevc",
+      "label": "监控前"
+    },
+    {
+      "id": "monitor_left",
+      "topic": "/drivers/camera/monitor_left_image_hevc",
+      "codec": "hevc",
+      "label": "监控左"
+    },
+    {
+      "id": "monitor_right",
+      "topic": "/drivers/camera/monitor_right_image_hevc",
+      "codec": "hevc",
+      "label": "监控右"
+    }
+  ]
+}

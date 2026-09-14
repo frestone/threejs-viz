@@ -1,0 +1,9 @@
+{
+  "endpoint": "s3-internal.cn-north-1.jdcloud-oss.com",
+  "region": "cn-north-1",
+  "accessKey": "85C76AB2AB89077E8500CB6021A81EC7",
+  "secretKey": "EEDD3436DF9B9ED075A39DEE468F66A2",
+  "verifySSL": false,
+  "metaApiUrl": "http://atumu-meta.jd.com/argo/generate_clips_info?recordName=",
+  "cacheDir": "/home/thor/data/demo_data/light_map/"
+}

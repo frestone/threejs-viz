@@ -1,0 +1,25 @@
+[package]
+name = "threejs-viz-desktop"
+version = "0.1.0"
+description = "Three.js Viz 桌面外壳（Tauri v2）——打包同一份 React + Three.js 渲染 UI"
+authors = ["threejs-viz"]
+edition = "2021"
+rust-version = "1.77"
+
+# 库目标供 mobile/桌面共用；桌面二进制入口在 src/main.rs。
+[lib]
+name = "threejs_viz_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# 默认无自定义 protocol，webview 直接加载 devUrl / frontendDist。
+custom-protocol = ["tauri/custom-protocol"]

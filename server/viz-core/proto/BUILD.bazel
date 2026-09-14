@@ -1,0 +1,22 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+
+# 统一数据模型 frame.proto -> frame.pb.{h,cc}。
+# strip_import_prefix = "/server" 使 proto 逻辑根为 server/,
+# 生成头路径为 viz-core/proto/frame.pb.h,与 include/viz/frame.h 的
+#   #include "viz-core/proto/frame.pb.h"
+# 完全对齐。
+proto_library(
+    name = "frame_proto",
+    srcs = ["frame.proto"],
+    strip_import_prefix = "/server",
+    visibility = ["//visibility:public"],
+)
+
+cc_proto_library(
+    name = "frame_cc_proto",
+    deps = [":frame_proto"],
+    visibility = ["//visibility:public"],
+)

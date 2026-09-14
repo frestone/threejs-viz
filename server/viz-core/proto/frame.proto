@@ -1,0 +1,167 @@
+// -----------------------------------------------------------------------------
+// 统一数据模型（protobuf 版）——取代原 viz/frame.h 的 C++ struct 定义。
+//
+// 由 protoc 生成 frame.pb.h / frame.pb.cc（见 BUILD.bazel 的 proto_library +
+// cc_proto_library）。数据抽象层输出、渲染层输入、以及厚后端 WebSocket 推流的
+// 序列化载荷，统一使用这里定义的 message。
+//
+// 【配置化 Frame】Frame 是按图层名索引的通用几何容器：
+//   map<string, LayerData> layers（key = decoder.json 图层名 layer.source）。
+// 每个图层承载一种基础几何(point/linestrip/box/polygon/text)的若干实例。
+//
+// 注：业务方法（indexAtTime 二分 / duration / empty / size / layer 访问）不在
+// proto 里，改由 C++ 侧的 DatasetView 包装类 + 自由函数 helper 承载（见 frame.h）。
+// -----------------------------------------------------------------------------
+syntax = "proto3";
+
+package viz;
+
+// 生成更紧凑的 C++ 代码（禁用 arena 之外的默认体积优化项由构建侧控制）。
+option optimize_for = SPEED;
+
+// 三维向量（右手系，x 前 / y 左 / z 上，具体约定由 SourceProfile 归一化保证）。
+message Vec3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+// 基础几何图元类型（与 DecoderConfig 的两层 schema level1 对应）。
+// proto3 枚举首值必须为 0——对应原 enum class 的首项 Point。
+enum GeometryKind {
+  POINT = 0;      // 单点
+  LINESTRIP = 1;  // 折线/点集
+  BOX = 2;        // 有向包围盒（position + size + heading）
+  POLYGON = 3;    // 多边形点集（闭合环）
+  TEXT = 4;       // 文本标注（position + text）
+  ARROW = 5;      // 箭头（position + heading + size 缩放）
+  PLANNING_TRAJECTORY = 6; // 规划轨迹带（points 折线沿法向扩展宽度成多边形，宽度见 style.width）
+}
+
+// 通用几何单元：一种中性结构承载所有基础图元的数据。渲染层依据其所属
+// LayerData.kind 决定读取哪些字段：
+//   POINT     -> position
+//   LINESTRIP -> points
+//   BOX       -> position + size + heading
+//   POLYGON   -> points（闭合环）
+//   TEXT      -> position + text
+// 语义元数据 id/type/score 与几何解耦，供拾取、按类型上色等使用（可选填）。
+message GeometryItem {
+  Vec3 position = 1;           // POINT/BOX/TEXT 用
+  repeated Vec3 points = 2;    // LINESTRIP/POLYGON 用
+  Vec3 size = 3;               // BOX 用：length(x)/width(y)/height(z)
+  float heading = 4;           // BOX 用：弧度
+  string text = 5;             // TEXT 用
+  // 语义元数据（可选）：
+  int32 id = 6;
+  int32 type = 7;              // 供渲染层 colorByType 上色
+  float score = 8;
+}
+
+// 一个图层的几何数据：几何类型 + 该类型的若干实例。
+message LayerData {
+  GeometryKind kind = 1;
+  repeated GeometryItem items = 2;
+}
+
+// 一帧图像（相机/传感器画面）。data 为编码后的原始字节。
+message Image {
+  string format = 1;   // 编码格式："jpeg" / "png" / "rgb8" 等
+  uint32 width = 2;
+  uint32 height = 3;
+  bytes data = 4;
+  double t = 5;
+}
+
+// 一份原始数据（RawData）：不在默认传输通道、需前端勾选后按需订阅的“另一类数据”。
+// 承载任意原始传感器字节流（如雷达回波 / 未解码的原始帧 / 厂商私有二进制等）。
+// 后端只做“按 topic 取原始字节 + 最小占位解析”，具体语义由 format 标识、前端/后续按需解析。
+// 设计为可扩展：data 保留完整原始字节，format/encoding 描述其含义，避免每来一种原始数据就改协议。
+message RawData {
+  string topic = 1;     // 来源 topic（与 decoder.json rawDataLayer.topic 对应）
+  string format = 2;    // 数据语义标识（如 "radar_echo" / "raw_pointcloud2" / 厂商私有），供解析分派
+  bytes data = 3;       // 原始字节（完整保留，未解码）
+  double t = 4;         // 采集时间戳（秒），可选
+  string frame_id = 5;  // 可选坐标系标识
+  string encoding = 6;  // 预留压缩/编码标识，""=raw
+  uint64 seq = 7;       // 可选原始消息序号 / logTime，用于去重
+}
+
+// 一帧点云。xyz 打平存储（[x0,y0,z0, x1,y1,z1, ...]），点数 = size(xyz)/3。
+// 可选逐点颜色 rgb（打平，长度应为 点数*3，取值 0..1），为空则前端按 point_size/统一色渲染。
+// intensity 可选逐点强度（长度应为 点数），供前端按强度上色。
+// encoding 预留压缩标识（""=raw packed float；后续可扩展 "zstd"/"draco"），当前仅支持 raw。
+message PointCloud {
+  repeated float xyz = 1 [packed = true];        // 打平坐标，每 3 个为一点
+  repeated float rgb = 2 [packed = true];        // 可选逐点颜色 0..1，打平
+  repeated float intensity = 3 [packed = true];  // 可选逐点强度
+  double t = 4;                                  // 采集时间戳（秒），可选
+  string frame_id = 5;                           // 可选坐标系标识（如 "ego"/"map"）
+  string encoding = 6;                           // 预留压缩标识，""=raw
+}
+
+// -----------------------------------------------------------------------------
+// 【自定义 2D 图表】通用时序/曲线图表数据模型。
+//
+// 设计目标：让用户"新增一种图表显示"无需改协议——参考数据源里形态各异的
+// MetricData / STGraphCurve / STGraph / VTGraph 全部归一为"若干条命名曲线 +
+// 可选上下界约束带"这一通用结构，由 ChartConfig(JSON) 声明如何从消息字段提取，
+// 前端按 series.kind 通用绘制。新增图表 = 加一条 JSON 图层，而非改 proto。
+// -----------------------------------------------------------------------------
+
+// 单条曲线的画法。渲染层据此决定折线/散点/约束带上下沿。
+enum ChartSeriesKind {
+  CS_LINE = 0;        // 折线（默认）
+  CS_SCATTER = 1;     // 离散点
+  CS_BAND_UPPER = 2;  // 约束带上界（与紧邻的 BAND_LOWER 配对填充）
+  CS_BAND_LOWER = 3;  // 约束带下界
+}
+
+// 一条命名曲线：等长的 x/y 采样序列。
+message ChartSeries {
+  string name = 1;                 // 曲线名（图例）
+  repeated float x = 2;            // 横轴采样（如 t / s）
+  repeated float y = 3;            // 纵轴采样（如 v / a / value）
+  ChartSeriesKind kind = 4;        // 画法
+  string color = 5;                // 可选 "#RRGGBB"，空则由前端调色板分配
+}
+
+// 一张 2D 图表：标题 + 轴标注 + 若干曲线。承载 metric 曲线 / ST 图 / VT 图等。
+message ChartData {
+  string title = 1;                // 图表标题
+  string x_label = 2;              // 横轴标注
+  string y_label = 3;              // 纵轴标注
+  repeated ChartSeries series = 4; // 曲线集合
+}
+
+// 单帧：以自车定位时刻为锚点，聚合当帧所有图层的几何。
+message Frame {
+  double t = 1;  // 相对起始时间（秒）
+
+  // 通用几何容器：key = decoder.json 图层名（layer.source），value = 该图层几何。
+  map<string, LayerData> layers = 2;
+
+  // 自车锚点（供相机跟随，与图层几何解耦，避免相机依赖某个具体图层名）。
+  Vec3 ego_anchor = 3;
+  float ego_yaw = 4;
+  bool ego_valid = 5;
+
+  // 【自定义 2D 图表】按图表名索引的图表容器，与 3D layers 并列。
+  // key = ChartConfig.id（图表图层名），value = 当帧该图表的曲线数据。
+  map<string, ChartData> charts = 6;
+
+  // 按相机/通道名索引的图像容器（key = 相机名）。
+  map<string, Image> images = 7;
+
+  // 按通道名索引的点云容器（key = 点云图层名，见 decoder.json pointCloudLayer.name）。
+  map<string, PointCloud> point_clouds = 8;
+
+  // 按通道名索引的原始数据容器（key = RawData 图层名，见 decoder.json rawDataLayer.name）。
+  // 与 images/point_clouds 一样：默认不下发，仅前端勾选订阅后按需注入。
+  map<string, RawData> raw_data = 9;
+}
+
+// 数据集：有序帧序列。业务方法见 C++ 侧 DatasetView 包装类。
+message Dataset {
+  repeated Frame frames = 1;
+}

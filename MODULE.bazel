@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Bzlmod 模块声明 (Bazel 7+)。
+#
+# threejs-viz C++ 后端已从「零依赖合成数据」升级为复用 filament_mvp 的真实数据
+# 解码链路(decoder.json 驱动 + MCAP + S3 流式拉取),因此需引入:
+#   - protobuf / rules_proto : 统一数据模型 frame.proto -> frame.pb.{h,cc}
+#   - websocketpp + asio     : WebSocket 回放服务 + S3 HTTPS(SigV4)传输
+# MCAP zstd 解压与 SigV4/TLS 使用系统库(-lzstd / -lssl / -lcrypto),
+# nlohmann/json 以 vendored 单头(server/third_party/nlohmann)提供。
+# ---------------------------------------------------------------------------
+module(
+    name = "threejs_viz",
+    version = "0.1.0",
+)
+
+# 基础 C++ 规则。
+bazel_dep(name = "rules_cc", version = "0.0.9")
+bazel_dep(name = "bazel_skylib", version = "1.5.0")
+
+# 单元测试框架:cc_test + GTEST_MAIN(后端发帧速率等测试)。
+bazel_dep(name = "googletest", version = "1.14.0", repo_name = "com_google_googletest")
+
+# Protocol Buffers:proto_library / cc_proto_library 规则 + protoc + C++ runtime。
+bazel_dep(name = "protobuf", version = "27.3", repo_name = "com_google_protobuf")
+bazel_dep(name = "rules_proto", version = "6.0.2")
+
+# Native WebSocket 回放服务:header-only websocketpp + standalone Asio。
+bazel_dep(name = "websocketpp", version = "0.8.2.bcr.1")
+
+# S3 数据源:asio + asio::ssl 做 HTTPS,配合系统 OpenSSL 手写 SigV4 签名。
+bazel_dep(name = "asio", version = "1.28.2")
+
+# ---------------------------------------------------------------------------
+# 前视图像 HEVC 解码:用 rules_foreign_cc 从 FFmpeg n6.1.1 源码 configure+make
+# 静态编译(裁剪到仅 HEVC 解码 + swscale + mjpeg 编码),静态链接进 viz_backend
+# 单体二进制。这样 Tauri 打包产物自包含,部署环境无需预装 FFmpeg 运行时库。
+# 构建规则见 //server/third_party:ffmpeg.BUILD(configure_make),Bazel 负责
+# 依赖管理与缓存(首次编译较慢,之后命中缓存)。
+# ---------------------------------------------------------------------------
+bazel_dep(name = "rules_foreign_cc", version = "0.12.0")
+
+http_archive = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive"
+)
+http_archive(
+    name = "ffmpeg",
+    urls = [
+        "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.1.1.tar.gz",
+    ],
+    strip_prefix = "FFmpeg-n6.1.1",
+    integrity = "sha256-fB6+qV2BXknB5gx+6BZBDexzqBuKwAKydngNL5BI5Zg=",
+    build_file = "//server/third_party:ffmpeg.BUILD",
+)

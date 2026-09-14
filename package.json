@@ -1,0 +1,48 @@
+{
+  "name": "threejs-viz",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "clean": "node -e \"const {platform}=process; const c=platform==='win32'?'powershell -NoProfile -ExecutionPolicy Bypass -File scripts/clear_cache.ps1':'bash scripts/clear_cache.sh'; require('child_process').execSync(c,{stdio:'inherit',shell:true})\"",
+    "clean:dry": "node -e \"const {platform}=process; const c=platform==='win32'?'powershell -NoProfile -ExecutionPolicy Bypass -File scripts/clear_cache.ps1 -DryRun':'bash scripts/clear_cache.sh --dry-run'; require('child_process').execSync(c,{stdio:'inherit',shell:true})\"",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:run": "./src-tauri/target/release/threejs-viz-desktop",
+    "tauri:xvfb": "xvfb-run -a ./src-tauri/target/release/threejs-viz-desktop",
+    "tauri:build:win": "tauri build",
+    "tauri:run:win": "./src-tauri/target/release/threejs-viz-desktop.exe",
+    "tauri:build:run:win": "npm run predeploy:kill && tauri build && bash scripts/run_release.sh",
+    "tauri:build:run:win:debug": "npm run predeploy:kill && npx tauri build --debug && bash scripts/run_release.sh",
+    "bundle:win": "tauri build",
+    "sidecar:copy": "bash scripts/copy_tauri_sidecar.sh",
+    "predeploy:kill": "bash scripts/kill_predeploy.sh",
+    "tauri:build:run": "npm run predeploy:kill && tauri build && bash scripts/run_release.sh",
+    "backend:build": "bazel build //server:viz_backend",
+    "backend:run": "cd server && ../bazel-bin/server/viz_backend 8080",
+    "app": "npm run tauri:build:run"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "echarts": "^6.1.0",
+    "protobuf-decoder": "^0.1.2",
+    "protobufjs": "^7.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.169.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "typescript": "^5.6.2",
+    "vite": "^8.2.2"
+  }
+}

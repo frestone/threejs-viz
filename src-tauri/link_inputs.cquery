@@ -1,0 +1,13 @@
+# cquery starlark:导出 viz_ffi_lib 全传递依赖的静态库路径(execroot 相对路径)。
+# 由 build.rs 调用,拿到拓扑排序后的链接输入清单逐个 emit 给 rustc。
+def format(target):
+    cc = providers(target).get("CcInfo")
+    if cc == None:
+        return ""
+    out = []
+    for li in cc.linking_context.linker_inputs.to_list():
+        for lib in li.libraries:
+            f = lib.static_library or lib.pic_static_library
+            if f:
+                out.append(f.path)
+    return "\n".join(out)

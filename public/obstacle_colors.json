@@ -1,0 +1,27 @@
+{
+  "//": "障碍物类型 → 名称 + 颜色配置。单一来源。由 ROVER5.0 common/proto/perception/perception_type.proto 的 jdx.rover.perception.proto.Type 枚举转换而来。",
+  "//sync": "proto 新增/调整类型时，同步更新此文件的 id/name；color 形如 #RRGGBB，未配置的类型渲染层按名称 hash 生成兜底色。",
+  "types": [
+    { "id": 0,  "name": "MISC",                       "color": "#B0B0B0" },
+    { "id": 1,  "name": "CAR",                        "color": "#66BFFF" },
+    { "id": 2,  "name": "PEDESTRIAN",                 "color": "#FF8C33" },
+    { "id": 3,  "name": "CYCLIST",                    "color": "#99FF73" },
+    { "id": 4,  "name": "TRUCK",                      "color": "#4D99FF" },
+    { "id": 5,  "name": "BUS",                        "color": "#4D99FF" },
+    { "id": 6,  "name": "POINT_CLOUD_CLUSTER",        "color": "#C0C0C0" },
+    { "id": 7,  "name": "ARTIFICIAL_VARIABLE_OBJECT", "color": "#D4A5FF" },
+    { "id": 8,  "name": "TRAFFIC_CONE",               "color": "#FFD94D" },
+    { "id": 9,  "name": "LOW_PROFILE_OBSTACLE",       "color": "#E0C070" },
+    { "id": 10, "name": "ROAD_SEWER",                 "color": "#9090A0" },
+    { "id": 11, "name": "STATIC_NON_MOTOR",           "color": "#99E699" },
+    { "id": 12, "name": "WATER_BARRIER",              "color": "#FFD94D" },
+    { "id": 13, "name": "TRICYCLE",                   "color": "#99FF73" },
+    { "id": 14, "name": "CYCLIST_STOPPED",            "color": "#99FF73" },
+    { "id": 15, "name": "POLE",                       "color": "#CCCCCC" },
+    { "id": 16, "name": "JD_VEHICLE",                 "color": "#66BFFF" },
+    { "id": 17, "name": "OTHERS_VEHICLE",             "color": "#66BFFF" },
+    { "id": 18, "name": "IMAGE_OCC",                  "color": "#A0A0A0" },
+    { "id": 19, "name": "ALL",                        "color": "#B0B0B0" },
+    { "id": 20, "name": "ROAD_CURB",                  "color": "#8899AA" }
+  ]
+}
