@@ -25,6 +25,8 @@ export default function App() {
   // 前端不硬编码。cameraOn=已勾选/已订阅的通道集合（默认空，零成本）；
   // cameraUrls=各通道当前帧 JPEG 的 Blob URL（切帧时 revoke 旧 URL 防泄漏）。
   const [imageDefs, setImageDefs] = useState<ImageChannelDef[]>([]);
+  const imageDefsRef = useRef<ImageChannelDef[]>([]);
+  const autoImageRequestedRef = useRef(false);
   const [cameraOn, setCameraOn] = useState<Set<string>>(() => new Set<string>());
   const [cameraUrls, setCameraUrls] = useState<Record<string, string>>({});
   const cameraUrlsRef = useRef<Record<string, string>>({});
@@ -100,11 +102,25 @@ export default function App() {
   // 接收服务端下发的相机图像通道定义（唯一来源 decoder*.json 的 imageChannels）：
   // 更新图像组的相机复选框列表；默认全部不勾选、不订阅（零成本）。
   const onImageDefs = (defs: ImageChannelDef[]) => {
+    imageDefsRef.current = defs;
     setImageDefs(defs);
+    trySubscribeFirstImage();
   };
 
   // 是否运行在 Tauri 桌面外壳中（决定是否启用原生文件对话框直传）。
   const desktop = isTauri();
+
+  // 默认订阅第一路相机。IMAGE_DEFS 可能早于/晚于 engineRef 挂载，因此在这两个
+  // 时点都尝试一次；autoImageRequestedRef 保证整个应用生命周期只自动订阅一次。
+  const trySubscribeFirstImage = () => {
+    if (autoImageRequestedRef.current) return;
+    const firstChannel = imageDefsRef.current[0];
+    const engine = engineRef.current;
+    if (!firstChannel || !engine) return;
+    autoImageRequestedRef.current = true;
+    setCameraOn((prev) => new Set(prev).add(firstChannel.id));
+    engine.subscribeImage?.(firstChannel.id, true);
+  };
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -195,6 +211,7 @@ export default function App() {
       }
       engineRef.current = result.engine;
       setEngineKind(result.kind);
+      trySubscribeFirstImage();
       // 同步初始可见性到引擎。
       Object.entries(defaultVisible()).forEach(([id, v]) =>
         result.engine.setLayerVisible(id, v)

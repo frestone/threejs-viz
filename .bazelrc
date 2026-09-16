@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# 平台相关配置。--enable_platform_specific_config 让 Bazel 自动启用
+# build:<host os> 配置(linux/windows/macos),无需手工 --config=。
+# ---------------------------------------------------------------------------
+common --enable_platform_specific_config
+
+# macOS 使用 Xcode/CommandLineTools 的 Apple clang。clang 21 起把
+# __is_trivially_relocatable 等内置函数标记为 deprecated,而 protobuf/abseil
+# (27.3 / 20240116)内部开了 -Werror,会把该警告升级成编译错误:
+#   external/abseil-cpp~/absl/meta/type_traits.h:511:36: error: builtin
+#   __is_trivially_relocatable is deprecated; use
+#   __builtin_is_cpp_trivially_relocatable instead [-Werror,-Wdeprecated-builtins]
+# 这里关掉该警告(仅 macOS 生效;其他平台上 clang 会忽略未知的 -Wno- 开关)。
+build:macos --copt=-Wno-deprecated-builtins
+build:macos --host_copt=-Wno-deprecated-builtins
+
+# Bazel 自动探测的 macOS 工具链默认按 `-mmacosx-version-min=10.11` 编译,而
+# viz-core 用了 std::filesystem(macOS 10.15+ 才有),不提升会直接编译失败:
+#   error: 'path' is unavailable: introduced in macOS 10.15
+# 这里统一抬到 11.0(Apple Silicon 的最低支持版本,与 tauri.macos.conf.json 的
+# minimumSystemVersion 一致)。链接期同参数,避免 deployment target 不一致告警。
+build:macos --copt=-mmacosx-version-min=11.0
+build:macos --host_copt=-mmacosx-version-min=11.0
+build:macos --linkopt=-mmacosx-version-min=11.0
+
+# Xcode 的 C++ 工具链默认按 -std=c++14 编译,而本仓库各 target 的 copts 写的是
+# -std=c++17。两者混用会造成 absl/protobuf 与本仓库代码对 string_view 的理解
+# 不一致(C++14 下 absl::string_view 是自有类型,C++17 下被 typedef 成
+# std::string_view),链接期表现为 absl 符号缺失:
+#   "void absl::...::LogMessage::CopyToEncodedBuffer<...>(std::__1::basic_string_view<char>)"
+# 统一钉到 C++17,让依赖与本仓库代码用同一套 ABI。
+build:macos --cxxopt=-std=c++17
+build:macos --host_cxxopt=-std=c++17
+
+# 若开发者在 shell 里钉了 SDKROOT(本机 CLT 默认 SDK 与 ld 不匹配时的标准解法),
+# 需要继承到 repo 探测(工具链按它算 builtin include 目录)与 action 环境(编译
+# 链接按它找头文件/库)。两边必须一致,否则报:
+#   ERROR: ... Compiling ... failed: absolute path inclusion(s) found in rule ...
+# 未设置 SDKROOT 时这几个开关是空操作(不带 =值 = 从 client env 继承)。
+build:macos --repo_env=SDKROOT
+build:macos --action_env=SDKROOT
+build:macos --host_action_env=SDKROOT

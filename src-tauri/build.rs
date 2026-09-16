@@ -26,12 +26,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(viz_ffi_stubs)");
     // 始终先跑 Tauri 自身的构建步骤。
     tauri_build::build();
 
     // 仅桌面(非 wasm/其它)且默认启用 FFI 链接;可用环境变量跳过(纯前端调试)。
+    println!("cargo:rerun-if-env-changed=VIZ_SKIP_FFI_LINK");
     if env::var("VIZ_SKIP_FFI_LINK").is_ok() {
         println!("cargo:warning=VIZ_SKIP_FFI_LINK 已设置,跳过 viz_ffi 静态链接(桌面 FFI 将不可用)");
+        println!("cargo:rustc-cfg=viz_ffi_stubs");
         return;
     }
 
@@ -83,8 +86,6 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", server_dir.join(rel).display());
     }
-    println!("cargo:rerun-if-env-changed=VIZ_SKIP_FFI_LINK");
-
     // 0) 把 server/configs 复制到 target/<profile>/configs。
     //    viz-core 的 resolveConfigPath 会按 cwd -> exe 同目录 -> /usr/bin 回退解析
     //    "configs/*.json";桌面二进制从项目根启动时 cwd 无 configs/,依赖 exe 同目录
@@ -92,12 +93,161 @@ fn main() {
     copy_configs_next_to_binary(&server_dir);
 
     // 按平台执行 FFI 静态链接编排:Linux 用 GCC 风格的 rules_foreign_cc FFmpeg +
-    // -Wl,--whole-archive;Windows 用 MSVC /WHOLEARCHIVE + vcpkg 预编译静态库。
+    // -Wl,--whole-archive;macOS 用 Apple ld(-force_load)+ libc++ + Homebrew 系统库;
+    // Windows 用 MSVC /WHOLEARCHIVE + vcpkg 预编译静态库。
     if env::consts::OS == "windows" {
         link_viz_ffi_windows(&workspace_dir);
+    } else if env::consts::OS == "macos" {
+        link_viz_ffi_macos(&workspace_dir);
     } else {
         link_viz_ffi_linux(&workspace_dir);
     }
+}
+
+/// macOS(Apple ld + libc++)链路。
+///
+/// 与 Linux 同构:Bazel 构建 viz_ffi_archive(viz_ffi_lib + 全部传递依赖聚合成
+/// 单个 .a),@ffmpeg 由 rules_foreign_cc 源码编译。三处平台差异:
+///   1) 归档与 FFmpeg 库落在 `bazel-out/darwin_arm64-fastbuild`(Apple Silicon)
+///      或 `bazel-out/darwin-fastbuild`(Intel),config 名随 CPU 变,故递归定位
+///      而非硬编码路径(与 Windows 分支同策略)。
+///   2) Apple ld 不认 `--whole-archive`,等价写法是 `-force_load <archive>`,
+///      否则 viz_ffi_lib 的 extern "C" 符号会被 GC 掉。
+///   3) 系统库来自 Homebrew:libc++(macOS 无 libstdc++)、zstd(MCAP 解压)、
+///      openssl@3(SigV4/TLS)、jpeg(缩略图重编码)。Homebrew 的 dylib 安装名是
+///      绝对路径,故链接期给出 -L 即可,运行期无需 rpath。
+fn link_viz_ffi_macos(workspace_dir: &Path) {
+    // 1) 构建聚合静态库,并显式构建 @ffmpeg 以物化 FFmpeg 三个 .a
+    //    (理由同 Linux 分支:rules_foreign_cc 的 copy_ffmpeg 输出不在
+    //    cc_static_library 的传递闭包里)。
+    run_bazel(
+        workspace_dir,
+        &["build", CC_STATIC_FLAG, FFI_ARCHIVE_TARGET, FFMPEG_TARGET],
+    );
+
+    // 2) 递归定位 libviz_ffi_archive.a(darwin_arm64/darwin 子目录名随 CPU 变)。
+    let exec_root = PathBuf::from(bazel_info(workspace_dir, "execution_root").trim());
+    let bazel_out = exec_root.join("bazel-out");
+    let archive = find_file_named(&bazel_out, "libviz_ffi_archive.a", None).unwrap_or_else(|| {
+        panic!(
+            "未在 execroot 找到 libviz_ffi_archive.a(macOS cc_static_library 输出): {}",
+            bazel_out.display()
+        )
+    });
+
+    // 3) -force_load 保住 viz_ffi_lib 导出的 extern "C" 符号。
+    println!("cargo:rustc-link-arg=-Wl,-force_load,{}", archive.display());
+    if let Some(dir) = archive.parent() {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    println!(
+        "cargo:warning=viz_ffi 静态链接聚合库(macOS): {}",
+        archive.display()
+    );
+
+    // 4) FFmpeg 静态库。Apple ld 对静态库的顺序不敏感(默认多遍解析),
+    //    但仍按 avcodec -> swscale -> swresample -> avutil 的依赖序给出。
+    let ffmpeg_libs = locate_ffmpeg_static_libs(&exec_root);
+    assert!(
+        !ffmpeg_libs.is_empty(),
+        "未在 execroot 找到 FFmpeg 静态库(libavcodec/libavutil/...): {}",
+        exec_root.display()
+    );
+    for lib in &ffmpeg_libs {
+        println!("cargo:rustc-link-arg={}", lib.to_string_lossy());
+    }
+    println!("cargo:warning=FFmpeg 静态库 {} 个已链接", ffmpeg_libs.len());
+
+    // 5) C++ 运行时 + 系统库(zstd / openssl / jpeg)。
+    let sys_prefix = sys_prefix();
+    println!("cargo:rustc-link-lib=dylib=c++");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        sys_prefix.join("lib").display()
+    );
+    // openssl 单独处理:Homebrew 的 openssl 是 keg-only,库在
+    // <prefix>/opt/openssl@3/lib;conda 等前缀则直接落在 <prefix>/lib。
+    // (asio 1.28 与 OpenSSL 4 不兼容,需 3.x —— 与 sys_prefix.bzl 选择保持一致。)
+    let openssl_lib = ["opt/openssl@3/lib", "opt/openssl/lib"]
+        .iter()
+        .map(|rel| sys_prefix.join(rel))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| sys_prefix.join("lib"));
+    if !openssl_lib.is_dir() {
+        panic!(
+            "未找到系统 OpenSSL 库目录: {}。请 `brew install openssl@3 zstd jpeg`,\
+             或用 VIZ_SYS_PREFIX 指向已安装这些库的前缀。",
+            openssl_lib.display()
+        );
+    }
+    if openssl_lib != sys_prefix.join("lib") {
+        println!("cargo:rustc-link-search=native={}", openssl_lib.display());
+    }
+    // 运行期查找路径:Homebrew 的 dylib 安装名是绝对路径,不需要 rpath;
+    // 但 conda / MacPorts 一类前缀的 dylib 安装名是 @rpath/libssl.3.dylib,
+    // 缺少 LC_RPATH 时启动会直接报 "Library not loaded: @rpath/libzstd.1.dylib"。
+    for dir in [sys_prefix.join("lib"), openssl_lib.clone()] {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+    }
+    for lib in ["z", "zstd", "ssl", "crypto", "jpeg"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+    println!(
+        "cargo:warning=macOS 系统库已追加(libc++ / zstd / openssl / jpeg @ {})",
+        sys_prefix.display()
+    );
+}
+
+/// macOS 系统依赖(zstd / openssl / jpeg)前缀。必须与 Bazel 侧
+/// `//server/third_party:sys_prefix.bzl` 的探测顺序保持一致,否则 Bazel 编译期
+/// 与 Rust 链接期会指向不同的库。
+///
+/// 顺序:`VIZ_SYS_PREFIX` -> `HOMEBREW_PREFIX` -> Apple Silicon 默认 `/opt/homebrew`
+/// -> Intel 默认 `/usr/local` -> `$HOME/homebrew` -> `brew --prefix` 输出。
+fn sys_prefix() -> PathBuf {
+    for key in ["VIZ_SYS_PREFIX", "HOMEBREW_PREFIX"] {
+        let Some(prefix) = env::var_os(key) else { continue };
+        let prefix = PathBuf::from(prefix);
+        if prefix.is_dir() {
+            println!("cargo:warning=系统依赖前缀取自 {key}: {}", prefix.display());
+            return prefix;
+        }
+        println!(
+            "cargo:warning={key}={} 不存在,回退默认探测",
+            prefix.display()
+        );
+    }
+
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew"),
+        PathBuf::from("/usr/local"),
+    ];
+    // 非 sudo 的自定义安装位置(Homebrew 官方支持 tarball 解压到任意目录)。
+    if let Some(home) = env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("homebrew"));
+    }
+    for path in candidates {
+        if path.join("bin/brew").is_file() {
+            println!("cargo:warning=系统依赖前缀自动探测到: {}", path.display());
+            return path;
+        }
+    }
+
+    // 最后尝试 PATH 上的 brew(装在非标准位置但已加 PATH)。
+    if let Ok(output) = Command::new("brew").arg("--prefix").output() {
+        if output.status.success() {
+            let prefix = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if prefix.is_dir() {
+                println!("cargo:warning=系统依赖前缀取自 brew --prefix: {}", prefix.display());
+                return prefix;
+            }
+        }
+    }
+
+    panic!(
+        "未找到 macOS 系统依赖前缀。请安装 Homebrew 后 `brew install zstd openssl@3 jpeg`,\
+         或设置 VIZ_SYS_PREFIX 指向已安装这些库的目录;只调前端可用 VIZ_SKIP_FFI_LINK=1 跳过 FFI 链接。"
+    );
 }
 
 /// Linux(GCC/Clang)链路:构建 viz_ffi_archive + @ffmpeg(rules_foreign_cc 源码编译),
@@ -351,16 +501,35 @@ fn copy_configs_next_to_binary(server_dir: &Path) {
 }
 
 /// 运行 `bazel <args>`,失败即 panic(中断 cargo 构建)。
+///
+/// 若开发者在 shell 里钉了 `SDKROOT`(CLT 默认 SDK 与自带 ld 版本不匹配时需要),
+/// 把它透传给 Bazel 的 repo 探测与 action 环境:C++ 工具链探测、编译、链接必须
+/// 用同一个 SDK,否则会出现「clang 用 A SDK 的头文件、Bazel 记录的是 B SDK」
+/// 而报 `absolute path inclusion(s) found`。未设置 SDKROOT 时不加任何额外参数。
 fn run_bazel(server_dir: &Path, args: &[&str]) {
+    // bazel 的启动选项与命令选项位置敏感:`--repo_env/--action_env` 属于命令选项,
+    // 必须跟在子命令(如 `build`)之后,否则会被当成未知启动选项直接 FATAL。
+    let (subcommand, rest) = args.split_first().expect("run_bazel 至少要有子命令");
+    let mut command_args: Vec<String> = vec![(*subcommand).to_string()];
+    if let Ok(sdkroot) = env::var("SDKROOT") {
+        if !sdkroot.is_empty() {
+            command_args.push(format!("--repo_env=SDKROOT={sdkroot}"));
+            command_args.push(format!("--action_env=SDKROOT={sdkroot}"));
+            command_args.push(format!("--host_action_env=SDKROOT={sdkroot}"));
+            println!("cargo:warning=向 Bazel 透传 SDKROOT={sdkroot}");
+        }
+    }
+    command_args.extend(rest.iter().map(|arg| (*arg).to_string()));
+
     let status = Command::new("bazel")
-        .args(args)
+        .args(&command_args)
         .current_dir(server_dir)
         .status()
         .unwrap_or_else(|e| panic!("无法执行 bazel {:?}: {e}", args));
     assert!(
         status.success(),
         "bazel {:?} 失败(exit={:?})",
-        args,
+        command_args,
         status.code()
     );
 }

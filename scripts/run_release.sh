@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 运行构建好的 threejs-viz-desktop。
-# Linux 无显示环境时自动用 xvfb-run(需已安装); Windows 直接启动即可。
+# Linux 无显示环境时自动用 xvfb-run(需已安装); macOS/Windows 直接启动即可。
 # 注意: 该脚本会一直占用终端, 由 `exec` 替换当前 shell, 不要 Ctrl-C 后重跑——重复调用会反复 exec 到同一进程。
 
 set -uo pipefail
@@ -24,7 +24,10 @@ if [[ ! -f "$BIN" ]]; then
   exit 1
 fi
 
-if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # macOS 的图形会话由 WindowServer 提供,没有 X11 可用,也不需要 xvfb。
+  exec "$BIN"
+elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
   exec "$BIN"
 elif command -v xvfb-run >/dev/null 2>&1; then
   exec xvfb-run -a "$BIN"

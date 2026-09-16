@@ -1,0 +1,20 @@
+# 依赖与前端构建产物
+node_modules/
+dist/
+
+# Bazel 输出(符号链接 + 真实输出树;npm run clean 可清理)
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-threejs-viz
+
+# Tauri/Rust 编译产物
+src-tauri/target/
+
+# 本地运行日志与缓存
+nohup.out
+test.log
+node_modules/.vite
+
+# macOS
+.DS_Store

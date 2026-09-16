@@ -14,6 +14,8 @@
     "tauri:build": "tauri build",
     "tauri:run": "./src-tauri/target/release/threejs-viz-desktop",
     "tauri:xvfb": "xvfb-run -a ./src-tauri/target/release/threejs-viz-desktop",
+    "tauri:build:mac": "tauri build",
+    "tauri:build:run:mac": "npm run tauri:build:run",
     "tauri:build:win": "tauri build",
     "tauri:run:win": "./src-tauri/target/release/threejs-viz-desktop.exe",
     "tauri:build:run:win": "npm run predeploy:kill && tauri build && bash scripts/run_release.sh",

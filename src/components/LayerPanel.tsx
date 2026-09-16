@@ -223,7 +223,7 @@ export function LayerPanel(props: LayerPanelProps) {
                     checked={!!cameraOn?.has(d.id)}
                   onChange={(e) => onToggleCamera?.(d.id, e.target.checked)}
                   />
-                  <span>{d.label || d.id}</span>
+                  <span title={d.topic}>{d.label || d.id}</span>
                 </label>
               </li>
             ))}

@@ -1,5 +1,42 @@
 package(default_visibility = ["//visibility:public"])
 
+load("@rules_foreign_cc//toolchains/native_tools:native_tools_toolchain.bzl", "native_tool_toolchain")
+load(":system_make.bzl", "system_make_shim")
+
+# ---------------------------------------------------------------------------
+# macOS 专用:FFmpeg 构建改用系统自带 make。
+#
+# 背景:rules_foreign_cc 默认先源码自举 GNU Make 4.4.1 再用它跑 configure_make
+# (见 //server/third_party:ffmpeg.BUILD)。实测在 macOS 上这个自举 make 跑
+# FFmpeg 的 Makefile 会直接段错误:
+#     make -j4 → Segmentation fault: 11
+# 而 Apple 自带 /usr/bin/make(GNU Make 3.81)同一份 Makefile 正常(本仓库已
+# 手工复现:自举 make dry-run 退出码 139,系统 make 退出码 0)。
+#
+# 因此这里注册一个只在 macOS 执行平台上生效的 make toolchain,指向 /usr/bin/make。
+# 它在根模块注册,优先级高于 rules_foreign_cc 自己注册的 built_make_toolchain;
+# exec_compatible_with 限定 macOS,Linux 构建仍走原路径,行为不变。
+# ---------------------------------------------------------------------------
+# 树产物里是转发到 /usr/bin/make 的 shim(path 必须是 execroot 相对表达式,
+# 且 rules_foreign_cc 自举 pkg-config 时会读 target.files,见 system_make.bzl)。
+system_make_shim(
+    name = "system_make_shim",
+)
+
+native_tool_toolchain(
+    name = "system_make",
+    path = "$(execpath :system_make_shim)/bin/make",
+    target = ":system_make_shim",
+)
+
+toolchain(
+    name = "system_make_toolchain",
+    exec_compatible_with = ["@platforms//os:macos"],
+    toolchain = ":system_make",
+    toolchain_type = "@rules_foreign_cc//toolchains:make_toolchain",
+    visibility = ["//visibility:public"],
+)
+
 # vendored nlohmann/json 单头库(server.cpp / config.cpp / meta_client.cpp 使用)。
 cc_library(
     name = "nlohmann_json",

@@ -14,7 +14,10 @@ export default defineConfig({
     watch: {
       usePolling: true,
       // 不监听 Rust 外壳目录，避免与 tauri dev 的 cargo 编译互相触发。
-      ignored: ["**/src-tauri/**"],
+      // 同时排除 Bazel 输出目录（bazel-out / bazel-bin / bazel-* 都是仓库根下的
+      // 符号链接）：rules_foreign_cc 编译 FFmpeg 时会在里面持续写文件，不排除会
+      // 让 dev server 反复整页刷新（macOS 上实测刷屏）。
+      ignored: ["**/src-tauri/**", "**/bazel-*/**"],
     },
     proxy: {
       "/ws": {

@@ -20,6 +20,16 @@ config_setting(
     constraint_values = ["@platforms//os:windows"],
 )
 
+# macOS 平台选择点。系统库(zstd / openssl / jpeg)走 @viz_sys_prefix(repository_rule
+# 在 fetch 阶段探测 Homebrew 默认前缀,或用 VIZ_SYS_PREFIX 指定任意前缀;详见
+# //server/third_party:sys_prefix.bzl)。
+# FFmpeg 在 macOS 与 Linux 一样走 @ffmpeg(rules_foreign_cc 源码编译,见
+# //server/third_party:ffmpeg.BUILD),故 hevc_decoder 的 deps 无需分支。
+config_setting(
+    name = "macos",
+    constraint_values = ["@platforms//os:macos"],
+)
+
 # ---------------------------------------------------------------------------
 # hevc_decoder:HEVC(H.265)相机码流 -> JPEG 解码器。
 # @ffmpeg 由 rules_foreign_cc 从 FFmpeg n6.1.1 源码 configure+make 静态编译
@@ -36,12 +46,17 @@ cc_library(
             "include",
             "D:/vcpkg/installed/x64-windows-static-md/include",
         ],
+        # macOS 的 jpeglib.h 与 -ljpeg 由 @viz_sys_prefix//:jpeg 提供(见 deps)。
         "//conditions:default": ["include"],
     }),
     copts = ["-std=c++17"],
     linkopts = select({
         ":windows": ["D:/vcpkg/installed/x64-windows-static-md/lib/jpeg.lib"],
         "//conditions:default": ["-ljpeg"],
+    }),
+    deps = select({
+        ":macos": ["@viz_sys_prefix//:jpeg"],
+        "//conditions:default": [],
     }),
 )
 
@@ -100,6 +115,7 @@ cc_library(
         "src/data/meta_client.h",
     ],
     # include/:对外暴露 viz/*.h;src/:内部 data/*.h。
+    # macOS 的 <openssl/*.h>(s3_client.cpp 手写 SigV4)由 @viz_sys_prefix//:openssl 提供。
     includes = [
         "include",
         "src",
@@ -108,13 +124,15 @@ cc_library(
     # ASIO_STANDALONE:standalone Asio 不依赖 Boost。
     defines = ["ASIO_STANDALONE"],
     # 系统库:zstd(MCAP 解压) + OpenSSL(SigV4/TLS)。
-    # Windows 走 vcpkg 静态库名(zstd.lib/libssl.lib/libcrypto.lib),Linux 用 -l 前缀。
+    # Windows 走 vcpkg 静态库名(zstd.lib/libssl.lib/libcrypto.lib),Linux 用 -l 前缀,
+    # macOS 由 @viz_sys_prefix 提供 -L/-l(前缀由 repository_rule 探测)。
     linkopts = select({
         ":windows": [
             "D:/vcpkg/installed/x64-windows-static-md/lib/zstd.lib",
             "D:/vcpkg/installed/x64-windows-static-md/lib/libssl.lib",
             "D:/vcpkg/installed/x64-windows-static-md/lib/libcrypto.lib",
         ],
+        ":macos": [],
         "//conditions:default": ["-lzstd", "-lssl", "-lcrypto"],
     }),
     deps = [
@@ -123,7 +141,13 @@ cc_library(
         ":hevc_decoder",
         "@websocketpp//:websocketpp",
         "@asio",
-    ],
+    ] + select({
+        ":macos": [
+            "@viz_sys_prefix//:zstd",
+            "@viz_sys_prefix//:openssl",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
@@ -263,7 +287,11 @@ cc_test(
     srcs = ["test/jpeg_thumbnail_test.cc"],
     copts = ["-std=c++17"],
     includes = ["include"],
-    linkopts = ["-ljpeg"],
+    linkopts = select({
+        # macOS 的 jpeglib.h 与 -ljpeg 经 :jpeg_thumbnail -> @viz_sys_prefix//:jpeg 传递。
+        ":macos": [],
+        "//conditions:default": ["-ljpeg"],
+    }),
     deps = [
         ":jpeg_thumbnail",
         "@com_google_googletest//:gtest_main",

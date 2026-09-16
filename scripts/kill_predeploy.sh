@@ -7,7 +7,8 @@
 set -uo pipefail
 
 # Windows(Git Bash)下 fuser/pkill 通常不可用, 用 taskkill 代替。
-# 未安装 fuser/pkill 也不阻塞构建: 找不到命令时退出码会被忽略。
+# macOS 无 fuser, 用 lsof 释放端口。
+# 未安装对应命令也不阻塞构建: 找不到命令时退出码会被忽略。
 if command -v taskkill >/dev/null 2>&1; then
   # 按端口 8080 找进程: netstat 输出形如 "TCP 0.0.0.0:8080 ... PID"。
   taskkill //F //PID \
@@ -15,6 +16,10 @@ if command -v taskkill >/dev/null 2>&1; then
     2>/dev/null || true
   taskkill //IM viz_backend.exe //F 2>/dev/null || true
   taskkill //IM threejs-viz-desktop.exe //F 2>/dev/null || true
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  lsof -ti tcp:8080 2>/dev/null | xargs kill -9 2>/dev/null || true
+  pkill -x viz_backend 2>/dev/null || true
+  pkill -x threejs-viz-desktop 2>/dev/null || true
 else
   fuser -k 8080/tcp 2>/dev/null || true
   pkill -x viz_backend 2>/dev/null || true

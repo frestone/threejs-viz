@@ -39,6 +39,24 @@ bazel_dep(name = "asio", version = "1.28.2")
 # ---------------------------------------------------------------------------
 bazel_dep(name = "rules_foreign_cc", version = "0.12.0")
 
+# ---------------------------------------------------------------------------
+# macOS 系统依赖前缀探测(zstd / openssl / jpeg)。
+#
+# macOS 上这三个库由包管理器提供(Homebrew 默认,/opt/homebrew 或 /usr/local),
+# 也可能是 conda / MacPorts / 自定义前缀。Bazel 的 BUILD 不能读环境变量,故用
+# repository_rule 在 fetch 阶段探测一次,生成 @viz_sys_prefix//:{zstd,openssl,jpeg}
+# 三个带 -I/-L 的小库(Docker/Linux/Windows 构建不会用到,不受影响)。
+# 覆盖方式:export VIZ_SYS_PREFIX=/your/prefix,详见 server/third_party/sys_prefix.bzl。
+# ---------------------------------------------------------------------------
+viz_sys_prefix = use_repo_rule("//server/third_party:sys_prefix.bzl", "viz_sys_prefix")
+
+viz_sys_prefix(name = "viz_sys_prefix")
+
+# macOS 上用系统 make 而非 rules_foreign_cc 自举的 GNU Make 4.4.1
+# (后者跑 FFmpeg 的 Makefile 会段错误,见 //server/third_party:BUILD.bazel 说明)。
+# 该 toolchain 带 exec_compatible_with = macOS,只在 macOS 构建时被选中。
+register_toolchains("//server/third_party:system_make_toolchain")
+
 http_archive = use_repo_rule(
     "@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive"
 )

@@ -1,12 +1,16 @@
 #include "config/config_paths.h"
 
 #include <array>
+#include <climits>
 #include <filesystem>
 #include <iostream>
+#include <vector>
 #include <system_error>
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #else
 #include <limits.h>
 #include <unistd.h>
@@ -20,7 +24,8 @@ bool isRegularFile(const std::string& path) {
     return std::filesystem::is_regular_file(path, ec);
 }
 
-// 当前可执行文件所在目录（Windows: GetModuleFileNameW；Linux: /proc/self/exe）。
+// 当前可执行文件所在目录（Windows: GetModuleFileNameW；Linux: /proc/self/exe；
+// macOS: _NSGetExecutablePath）。
 // 失败返回空。
 std::string exeDir() {
 #if defined(_WIN32)
@@ -31,6 +36,16 @@ std::string exeDir() {
     std::error_code ec;
     const auto dir = std::filesystem::path(std::wstring(buf.data(), n)).parent_path();
     return dir.string();
+#elif defined(__APPLE__)
+    // macOS 没有 /proc/self/exe。桌面 debug/release 的 configs 与可执行文件同级；
+    // 缺少这个分支会导致 decoder_lightmap.json 解析失败并回退到内置高精默认值。
+    std::vector<char> buf(PATH_MAX + 1);
+    uint32_t size = static_cast<uint32_t>(buf.size());
+    if (::_NSGetExecutablePath(buf.data(), &size) != 0) {
+        buf.resize(size + 1);
+        if (::_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    }
+    return std::filesystem::path(buf.data()).parent_path().string();
 #else
     std::array<char, PATH_MAX> buf{};
     const ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);

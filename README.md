@@ -10,7 +10,18 @@
 ## 环境要求
 
 - Node.js ≥ 20.12（项目用 Vite 8/rolldown，需较新 Node）、npm
-- 桌面构建额外需要 Rust 工具链 + 系统 WebView（Linux 需 WebKitGTK，Windows 用 WebView2）
+- 桌面构建额外需要 Rust 工具链 + 系统 WebView（macOS 用系统 WKWebView，装
+  Xcode Command Line Tools 即可；Linux 需 WebKitGTK，Windows 用 WebView2）
+
+> **macOS `npm: command not found`**：说明 Node 不在当前 zsh 的 PATH。若已用
+> 官方包安装到 `~/.local/node-v22.14.0-darwin-arm64`，先在本终端加入 PATH：
+>
+> ```bash
+> export PATH="$HOME/.local/node-v22.14.0-darwin-arm64/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+> command -v npm && npm --version
+> ```
+>
+> 或用 Homebrew 安装：`brew install node`。
 
 ## 安装依赖
 
@@ -71,6 +82,93 @@ npm run clean:dry
 > **一条命令构建并运行**：开发场景用 `npm run tauri:dev`（`tauri.conf.json` 的
 > `beforeDevCommand` 会自动起 Vite，再编译运行 Tauri 窗口）；生产场景用
 > `npm run tauri:build:run`（打包后自动启动 `threejs-viz-desktop` 可执行文件）。
+
+## 桌面端（macOS）
+
+macOS 用系统 clang/libc++ + Apple ld 构建同一份 C++ FFI 后端（无需 vcpkg，也无需
+手写 Bazel 链接参数），系统依赖统一走 Homebrew。
+
+### macOS 环境准备
+
+```bash
+# 1) Xcode Command Line Tools：提供 clang/clang++/ar/ranlib/make 与系统 WKWebView 头
+xcode-select --install
+
+# 2) Homebrew（https://brew.sh），然后装系统依赖
+brew install node zstd openssl@3 jpeg bazelisk
+
+# 3) Rust 工具链（Tauri 外壳）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+- **Bazel**：`bazelisk` 会按仓库根的 `.bazelversion` 拉取 Bazel 7.4.1。桌面 FFI
+  聚合静态库用 `cc_static_library`（需 7.4+ 且 `--experimental_cc_static_library`，
+  `src-tauri/build.rs` 已自动传该 flag）。
+- **Homebrew 系统依赖**：`zstd`（MCAP chunk 解压）、`openssl@3`（SigV4/HTTPS，
+  keg-only）、`jpeg`（缩略图重编码）。Bazel 侧
+  （`server/third_party/sys_prefix.bzl`）与 `build.rs` 会自动探测前缀：先是
+  `VIZ_SYS_PREFIX`，再是 Homebrew 默认前缀（Apple Silicon `/opt/homebrew`，Intel
+  `/usr/local`），然后是 `brew --prefix`。用 conda/MacPorts/自定义目录装这几个库时
+  显式指定即可：
+  ```bash
+  export VIZ_SYS_PREFIX=/your/prefix   # 需含 include/{zstd.h,openssl/,jpeglib.h} 与 lib/
+  ```
+- **必须是 OpenSSL 3.x**：asio 1.28（HTTPS/SigV4 底层）与 OpenSSL 4 不兼容
+  （`ASN1_STRING` 变成不完整类型，编译期报
+  `member access into incomplete type 'ASN1_STRING'`）。Homebrew 的 `openssl@3`
+  即为 3.x；用 `VIZ_SYS_PREFIX` 指向其他前缀时注意别选到 4.x。
+- **Cocoa 窗口**：Tauri 在 macOS 上直接用系统 WKWebView，不需要额外 WebView 依赖。
+
+### macOS 构建与运行
+
+```bash
+# Web 端（无桌面外壳）
+npm run dev
+
+# 桌面开发模式：自动起 Vite dev server + Tauri 窗口，带热更新
+npm run tauri:dev
+
+# 桌面生产打包 + 自动运行（.app 在 src-tauri/target/release/bundle/macos/，
+# .dmg 在 src-tauri/target/release/bundle/dmg/）
+npm run tauri:build:run:mac
+```
+
+> 说明：
+> - `npm install` 若报 `ERESOLVE`（`vite@8` 与 `@vitejs/plugin-react@4` 的 peer
+>   冲突），改用 `npm install --legacy-peer-deps`。
+> - `src-tauri/tauri.macos.conf.json` 把 `bundle.targets` 覆盖为 `["app", "dmg"]`
+>   （基线配置里的 `nsis` 是 Windows 专用），Tauri 构建时自动按平台合并该文件。
+> - macOS 链路与 Linux 的主要差异：Apple ld 用 `-force_load <archive>` 取代 GNU
+>   的 `--whole-archive`；C++ 运行时是 libc++（`c++`）而非 libstdc++（`stdc++`）；
+>   系统库按探测到的前缀给出 `-L/-I`（`openssl@3` 为 keg-only），并按需写
+>   LC_RPATH。FFmpeg 三个静态库仍与 Linux 一样由 `@ffmpeg`（rules_foreign_cc
+>   源码编译）产出，Rust 侧按 `bazel-out/darwin*-fastbuild/` 递归定位，不硬编码
+>   CPU 目录名。
+> - FFmpeg 的构建在 macOS 上改用系统 make（`server/third_party/system_make.bzl`
+>   注册 macOS 专用 make toolchain）：rules_foreign_cc 自举的 GNU Make 4.4.1 跑
+>   FFmpeg 的 Makefile 会段错误，而 Apple 自带 make 正常。
+> - Homebrew 的 `zstd`/`openssl@3`/`jpeg` 按动态库链接，产物在本机（已装 Homebrew）
+>   可直接运行；要分发到无 Homebrew 的机器，需改为静态链接或把 dylib 一并打包。
+> - 只调前端时可跳过 FFI 链接：`VIZ_SKIP_FFI_LINK=1 npm run tauri:dev`（桌面 FFI
+>   不可用，引擎回退到 mock 数据）。
+> - **系统依赖不在 Homebrew 默认前缀时**，非默认前缀的 dylib 安装名可能是
+>   `@rpath/...`，`build.rs` 已把该前缀的 `lib` 目录写进 LC_RPATH，产物可直接运行。
+>
+> **故障排查**：若构建时报
+> `ld: tapi error: malformed file ... error: unknown architecture arm64e.x1-macos`，
+> 说明本机 Command Line Tools 的默认 SDK 比自带的 `ld` 新（`xcrun --show-sdk-path`
+> 指向的 SDK 无法链接任何 C 程序，`clang -o t t.c` 都会失败）。挑一个能链接的旧 SDK
+> 固定给本次构建即可（`build.rs` 会把 `SDKROOT` 透传给 Bazel 的 repo 探测与 action 环境）：
+>
+> ```bash
+> # 逐个候选 SDK 试链接，第一个成功的即可用
+> export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+> ```
+>
+> 也可以升级/重装 Command Line Tools 从根上解决。构建期用到的其它 macOS 适配都记录在
+> 仓库里：`.bazelrc`（`-Wno-deprecated-builtins`、deployment target 11.0、统一
+> `-std=c++17`，避免 absl/protobuf 与本仓库代码的 `string_view` ABI 不一致）、
+> `server/third_party/system_make.bzl`（FFmpeg 用系统 make 构建）。
 
 ## 桌面端（Windows）
 

@@ -14,7 +14,9 @@
 // -----------------------------------------------------------------------------
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+#[cfg(not(viz_ffi_stubs))]
+use std::os::raw::c_char;
+use std::os::raw::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // 用户下行回调:收到一条完整字节封包(布局同 WsTransport)。
@@ -24,43 +26,139 @@ pub type MessageHandler = Box<dyn FnMut(&[u8]) + Send + 'static>;
 // ctx 里承载的是 MessageHandler 的堆分配(双层 Box 以获得瘦指针传给 C void*)。
 type HandlerBox = Box<MessageHandler>;
 
+#[cfg(viz_ffi_stubs)]
+use stubs::*;
+
 #[allow(non_camel_case_types)]
 type VizFfiSessionPtr = *mut c_void;
 
 // C 回调签名:void (*)(const uint8_t* msg, size_t len, void* ctx)。
+#[cfg(not(viz_ffi_stubs))]
 type RawCallback = extern "C" fn(*const u8, usize, *mut c_void);
 
 extern "C" {
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_session_create(on_message: RawCallback, ctx: *mut c_void) -> VizFfiSessionPtr;
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_session_destroy(session: VizFfiSessionPtr);
 
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_open(session: VizFfiSessionPtr, source: *const c_char);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_seek(session: VizFfiSessionPtr, time_sec: f64, generation: u64);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_paused(session: VizFfiSessionPtr, paused: c_int);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_speed(session: VizFfiSessionPtr, speed: f64);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_start_prefetch(session: VizFfiSessionPtr);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_image_subscription(
         session: VizFfiSessionPtr,
         channel: *const c_char,
         enabled: c_int,
     );
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_point_cloud_subscription(
         session: VizFfiSessionPtr,
         channel: *const c_char,
         enabled: c_int,
     );
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_raw_data_subscription(
         session: VizFfiSessionPtr,
         channel: *const c_char,
         enabled: c_int,
     );
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_set_playhead(session: VizFfiSessionPtr, time_sec: f64, generation: u64);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_close(session: VizFfiSessionPtr);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_ack_frame_bytes(session: VizFfiSessionPtr, bytes: u64);
 
     // 仅测试用。
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_test_emit_error(session: VizFfiSessionPtr, message: *const c_char);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_test_emit_frame(session: VizFfiSessionPtr, seq: u64);
+}
+
+/// `VIZ_SKIP_FFI_LINK=1` 时没有 C++ 后端。这里提供同符号 stub，使纯前端桌面
+/// 外壳可链接；会话创建固定失败，前端继续使用 mock 数据。
+#[cfg(viz_ffi_stubs)]
+mod stubs {
+    use std::os::raw::{c_char, c_int, c_void};
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_session_create(
+        _on_message: extern "C" fn(*const u8, usize, *mut c_void),
+        _ctx: *mut c_void,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_session_destroy(_session: *mut c_void) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_open(_session: *mut c_void, _source: *const c_char) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_seek(_session: *mut c_void, _time_sec: f64, _generation: u64) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_paused(_session: *mut c_void, _paused: c_int) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_speed(_session: *mut c_void, _speed: f64) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_start_prefetch(_session: *mut c_void) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_image_subscription(
+        _session: *mut c_void,
+        _channel: *const c_char,
+        _enabled: c_int,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_point_cloud_subscription(
+        _session: *mut c_void,
+        _channel: *const c_char,
+        _enabled: c_int,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_raw_data_subscription(
+        _session: *mut c_void,
+        _channel: *const c_char,
+        _enabled: c_int,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_playhead(
+        _session: *mut c_void,
+        _time_sec: f64,
+        _generation: u64,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_close(_session: *mut c_void) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_ack_frame_bytes(_session: *mut c_void, _bytes: u64) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_test_emit_error(_session: *mut c_void, _message: *const c_char) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_test_emit_frame(_session: *mut c_void, _seq: u64) {}
 }
 
 /// 在 P1-7 接入真实调用路径前，显式保留全部 C ABI 入口。
