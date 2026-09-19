@@ -60,6 +60,27 @@ npm run tauri:build
 npm run tauri:build:run
 ```
 
+## 导出 3DGS 数据集（图片 / 外参 / 主车位姿）
+
+`scripts/export_gs_dataset.py` 从一条 ROVER MCAP 里导出 3D Gaussian Splatting 需要的三部分
+数据：按观测时间命名的相机图片、相机内参+外参（来自 MCAP 标定附件
+`sensor_calib_param.conf`）、以及 `/localization/odometry_location` 主车轨迹，并生成
+nerfstudio 可直接读取的 `transforms.json`（逐帧 camera-to-world）。
+
+```bash
+python3 -m venv .venv-gs
+.venv-gs/bin/pip install -r scripts/requirements-gs-export.txt
+
+.venv-gs/bin/python scripts/export_gs_dataset.py \
+  --mcap /path/to/record.mcap \
+  --out  /path/to/gs_dataset \
+  --cameras all
+```
+
+输出 `manifest.json` / `calibration.json` / `ego_pose.{csv,json}` /
+`<camera>/transforms.json` 与 `<camera>/images/<观测时间>.jpg`，另有 `all/transforms.json`
+供多相机合并训练。完整参数与输出说明见 [`docs/GS_EXPORT.md`](docs/GS_EXPORT.md)。
+
 ## 清理编译中间产物
 
 清理可重新生成的前端、Bazel 与 Tauri 编译产物及工具缓存（`dist/`、`build/`、

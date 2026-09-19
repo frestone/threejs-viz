@@ -16,5 +16,9 @@ nohup.out
 test.log
 node_modules/.vite
 
+# 3DGS 导出脚本的 venv 与产物
+.venv-gs/
+gs_dataset/
+
 # macOS
 .DS_Store

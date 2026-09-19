@@ -1,0 +1,8 @@
+# MCAP 3DGS 导出脚本依赖（scripts/export_gs_dataset.py）
+# 用法：
+#   python3 -m venv .venv-gs
+#   .venv-gs/bin/pip install -r scripts/requirements-gs-export.txt
+mcap==1.4.0
+numpy>=1.24
+av>=12.0
+pillow>=10.0
