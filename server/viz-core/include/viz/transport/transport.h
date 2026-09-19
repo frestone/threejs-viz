@@ -60,6 +60,12 @@ struct RawDataDefs {
     std::vector<RawDataChannelDef> channels;  // 按配置 id(RawDataChannelDef.id)单键稳定排序
 };
 
+// 图像大数据交付模式：Desktop 原图优先；前后端分离部署只发送缓存缩略图。
+enum class ImageDeliveryMode {
+    Original,
+    Thumbnail,
+};
+
 // 发帧出口：会话层组好一帧后，通过该接口把帧交给传输层下发。
 // 传输层实现负责序列化封包（消息头 + seq + Frame proto）与背压控制。
 class IFrameSink {
@@ -131,6 +137,11 @@ public:
     // 倍速节流、独立于播放游标，不注入图像/点云，遇背压退避不丢帧。重复调用无副作用
     // （已在跑则忽略）；换源/Close 时停止并复位。
     virtual void StartPrefetch() = 0;
+
+    // 选择图像独立流的交付质量。Original 面向桌面/进程内部署：解码与传输都在本机，
+    // 尽量下发原始解码 JPEG；Thumbnail 面向浏览器/跨机 WebSocket：只交付低清缩略图，
+    // 避免多路高清 JPEG 挤占网络带宽。默认缩略图，桌面 FFI 在会话创建后显式切原图。
+    virtual void SetImageDeliveryMode(ImageDeliveryMode mode) { (void)mode; }
 
     // 订阅/取消订阅某图像通道（前视相机等）。订阅后，会话层在发帧前对该通道按帧
     // 时刻按需读取原始 HEVC 消息、解码为 JPEG 填入 frame.images 随帧下发；取消则不再

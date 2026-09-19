@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { noteImageLoaded } from "../engine/perfLog";
 
 interface Props {
   src: string | null;
@@ -71,10 +72,9 @@ export function CameraOverlay({ src, title, channelId, index, seq }: Props) {
     sessionStorage.setItem(sizeKey, JSON.stringify(size));
   }, [size]);
 
-  if (!src) return null;
-
   // 按 img 真实高度自动定高（避免每帧 setState 把高度写死）
   const autoHeight = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    noteImageLoaded(channelId, seq);
     const img = e.currentTarget;
     if (img.naturalWidth && size.h === 0) {
       setSize((s) => ({ ...s, h: Math.round((size.w * img.naturalHeight) / img.naturalWidth) }));
@@ -120,11 +120,15 @@ export function CameraOverlay({ src, title, channelId, index, seq }: Props) {
     window.removeEventListener("mouseup", onResizeEnd);
   };
 
+  // 订阅成功但第一帧尚未到达时也显示窗口。此前返回 null 会让用户看不到窗口，
+  // 从而无法区分“没有订阅”“解码中”“后端尚无图像”。
+  const displayedHeight = size.h || (src ? "auto" : Math.round(size.w * 9 / 16));
+
   return (
     <div
       ref={ref}
       className="camera-overlay"
-      style={{ left: pos.x, top: pos.y, width: size.w, height: size.h || "auto" }}
+      style={{ left: pos.x, top: pos.y, width: size.w, height: displayedHeight }}
     >
       <div className="camera-overlay-title" onMouseDown={onTitleMouseDown}>
         <span>{title}</span>
@@ -145,14 +149,18 @@ export function CameraOverlay({ src, title, channelId, index, seq }: Props) {
           ⟳
         </button>
       </div>
-      <img
-        ref={imgRef}
-        src={src}
-        alt={title}
-        className="camera-overlay-img"
-        draggable={false}
-        onLoad={autoHeight}
-      />
+      {src ? (
+        <img
+          ref={imgRef}
+          src={src}
+          alt={title}
+          className="camera-overlay-img"
+          draggable={false}
+          onLoad={autoHeight}
+        />
+      ) : (
+        <div className="camera-overlay-placeholder">等待图像数据…</div>
+      )}
       <div className="camera-overlay-handle" onMouseDown={onResizeMouseDown} />
     </div>
   );

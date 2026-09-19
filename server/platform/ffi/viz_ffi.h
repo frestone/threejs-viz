@@ -42,6 +42,12 @@ typedef void (*VizFfiMessageCallback)(const uint8_t* msg, size_t len, void* ctx)
 // 返回会话句柄;失败返回 NULL。
 VizFfiSession* viz_ffi_session_create(VizFfiMessageCallback on_message, void* ctx);
 
+// 设置 Debug 模式（1 开 / 0 关）。仅 Debug 模式输出性能诊断（image_*.csv、
+// 逐帧/每 50 帧日志、前端 perf 落盘），默认关闭以免影响播放性能。
+// 宿主入口(Rust)解析 VIZ_DEBUG 环境变量或 --debug 参数后调用；不调用时
+// C++ 侧默认读 VIZ_DEBUG 环境变量，均未设置则为关闭。
+void viz_ffi_set_debug(int enabled);
+
 // 销毁会话:内部 Close() 停播放/预取线程并 join,释放资源。销毁后句柄失效。
 void viz_ffi_session_destroy(VizFfiSession* session);
 

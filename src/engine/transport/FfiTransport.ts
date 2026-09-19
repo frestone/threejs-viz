@@ -35,14 +35,15 @@ export class FfiTransport implements Transport {
         if (!this.attempts.isCurrent(attempt)) return;
         const buffer =
           payload instanceof ArrayBuffer ? payload : new Uint8Array(payload).buffer;
-        // 预取帧(type=9)与大数据帧(type=11)在 C++ 侧累加在途字节水位做背压;前端每消费
-        // 一个此类封包立即回落等量字节(整包长度 = C++ 侧 fetch_add 的 buf.size()),解除退避。
-        // 普通帧(type=1)不计入水位,无需 ack。
-        // 【FFI 桌面 bug 修复】此前仅 ack type=9,但 SendBigDataFrame(type=11)同样 fetch_add
-        // 水位却从不回落 → 图像帧累加到 64MB 高水位后被永久丢弃,暂停态勾选相机面板不弹出。
+        // 预取帧(type=9)与 RawData 大数据帧(type=11 kind=1)在 C++ 侧累加在途字节水位做
+        // 背压;前端消费后立即回落等量字节(整包长度 = C++ 侧 fetch_add 的 buf.size())。
+        // 图像帧(type=11 kind=0)在 Desktop Original 模式下不进入该水位：它由后端
+        // 32帧有界实时队列控制，前端只显示最新帧；误 ack 反而会抵消预取水位。
         if (buffer.byteLength >= 1) {
-          const t = new DataView(buffer).getUint8(0);
-          if (t === 9 || t === 11) {
+          const view = new DataView(buffer);
+          const t = view.getUint8(0);
+          const bigDataKind = t === 11 ? view.getUint8(13) : -1;
+          if (t === 9 || (t === 11 && bigDataKind !== 0)) {
             this.call("ffi_ack_frame", { bytes: buffer.byteLength });
           }
         }

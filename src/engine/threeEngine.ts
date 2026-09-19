@@ -18,6 +18,7 @@ import type { ChartDef, LayerDef, ImageChannelDef, CameraMode, DataMode, RawData
 import { RawDataDecoder } from "./rawDataDecoder";
 import { createRawDataWiring } from "./rawDataWiring";
 import type { PanelState } from "../rawDataPanelState";
+import { isDebugEnabled } from "./perfLog";
 export interface ThreeEngineOptions {
   canvas: HTMLCanvasElement;
   wsUrl?: string;
@@ -138,9 +139,10 @@ export function createThumbnailStore(getGen: () => number, capacity = 12000) {
   }
 
   return {
-    // 收到一帧缩略图: 代次过期丢弃; seq 已存在去重; 否则建 blobUrl 按 tSec 升序插入。
+    // 收到一帧缩略图: 高于当前代次的在途帧丢弃; 同包 seek 后旧代次缓存仍然有效,
+    // 因此只拒绝更新代次; seq 已存在去重; 否则建 blobUrl 按 tSec 升序插入。
     handle(frame: BigDataFrameInput): void {
-      if (frame.gen !== getGen()) return;
+      if (frame.gen > getGen()) return;
       let ch = map.get(frame.channel);
       if (!ch) { ch = { list: [], seqSet: new Set() }; map.set(frame.channel, ch); }
       if (ch.seqSet.has(frame.seq)) return;  // 去重(后端已去重,双保险)
@@ -1603,7 +1605,9 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
       // fps=rAF 循环频率(主线程健康度); renderFps=去重后实际渲染帧率(≈数据帧率);
       // buildMs=scene.renderFrame 几何构建耗时; gpuMs=GPU 绘制耗时; cache=内存帧数;
       // aheadSec=已缓冲领先量(<0 或接近 0 表示供帧跟不上); starving=供帧饿死标志。
-      if (!paused && !scrubbing) {
+      // 仅 Debug 模式转发（VIZ_DEBUG / --debug / ?debug=1），打包默认关闭，
+      // 避免每 500ms 一次 IPC + stderr 输出影响播放。
+      if (isDebugEnabled() && !paused && !scrubbing) {
         const line =
           `[perf] fps=${statFps.toFixed(1)} renderFps=${statRenderFps.toFixed(1)} ` +
         `buildMs=${statBuildMs.toFixed(2)} gpuMs=${scene.getLastRenderMs().toFixed(2)} ` +

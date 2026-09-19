@@ -249,6 +249,52 @@ npm run app
 
 无后端时前端自动回退到 mock 数据，可直接 `npm run dev` 预览界面。
 
+## 播放卡顿诊断（各阶段耗时文件）
+
+性能诊断输出（`image_*.csv` 逐帧落盘、逐帧/每 50 帧日志、前端 perf 落盘）只在
+**Debug 模式**下输出，打包/生产默认关闭——诊断本身会引入每帧字符串拼接、文件
+I/O 与互斥锁，非 Debug 下热路径零开销，避免观测拖慢播放。
+
+开启 Debug 模式（进程启动时，任选其一）：
+
+```bash
+# 桌面端：debug 构建（tauri dev / tauri build --debug）默认开启；
+#         release 打包需显式开启：
+export VIZ_DEBUG=1 ./src-tauri/target/release/threejs-viz-desktop
+# 或
+./src-tauri/target/release/threejs-viz-desktop --debug
+
+# Web 后端（前后端分离部署）：
+VIZ_DEBUG=1 ./bazel-bin/server/viz_backend 8080
+# 或
+./bazel-bin/server/viz_backend --debug 8080
+
+# 浏览器端：URL 加 ?debug=1（dev 构建默认开启，vite build 打包默认关闭）
+```
+
+```bash
+# 自定义输出目录（可选）；不设置则输出到 $HOME/threejs-viz-perf
+export VIZ_PERF_LOG=/path/to/perf
+```
+
+开启后实时播放显示本地相机图像时，后端会为图像链路输出逐阶段耗时文件，便于
+定位「读包 / HEVC 解码 / 排队 / 发送 / 前端上屏」各阶段占比：
+
+| 文件 | 写入方 | 内容 |
+| --- | --- | --- |
+| `image_frames.csv` | C++ 后端 | 每批一行：本批下发帧数、读取微秒、解码微秒、其中 HEVC 解码/缩放/JPEG 编码微秒、喂帧数、是否 GOP 回退、JPEG 总字节数 |
+| `image_stages.csv` | C++ 后端 | 每通道每 30 帧一行：平均读取/解码耗时、平均 HEVC/缩放/JPEG 耗时、平均喂帧数、GOP 回退次数、JPEG 平均大小 |
+| `frontend_image.csv` | 前端(Tauri) | 每帧：大数据帧到达→建 Blob、Blob→`<img>` onLoad、端到端总耗时 |
+
+正常连续播放时 `emit_frames` 与 `feed_frames` 应接近（区间内每帧都下发），`gop_reload=0`；
+若长期出现大数值 `feed_frames` 与 `gop_reload=1`，说明窗口读取或播放头发生了断层。
+
+图像解码落后播放头超过阈值时会丢弃中间帧、从最近 I 帧重同步以限制延迟，阈值可调：
+
+```bash
+export VIZ_IMAGE_MAX_CATCHUP_MS=500   # 默认 500ms；设 0 表示不跳帧、始终按序追补（延迟会累积）
+```
+
 ## 目录结构
 
 ```

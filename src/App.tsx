@@ -3,14 +3,13 @@ import { PlaybackBar } from "./components/PlaybackBar";
 import { LayerPanel } from "./components/LayerPanel";
 import { ChartPanel } from "./components/ChartPanel";
 import { CameraOverlay } from "./components/CameraOverlay";
+import { noteBigDataArrival, noteBlobCreated, setDebugEnabled } from "./engine/perfLog";
 import { RawDataPanel } from "./components/RawDataPanel";
 import { type CameraMode, type ChartData, type ChartDef, type DataMode, type EngineApi, type ImageChannelDef, type LayerDef, type PlaybackStats, type RawDataChannelDef } from "./types";
 import { initialPanelState, type PanelState } from "./rawDataPanelState";
 import { createEngine, type EngineKind } from "./engine/engine";
 import { resolveTransportMode } from "./engine/transport/transportMode";
 import { isTauri, pickMcapPath } from "./tauri";
-import { shouldReleaseThumbnail } from "./engine/cameraPreviewTransition";
-
 // 图层可见性初始为空——由服务端下发的 LAYER_DEFS（onLayerDefs）动态填充，
 // 前端不再硬编码图层列表（唯一来源 decoder*.json 的 layers）。
 function defaultVisible(): Record<string, boolean> {
@@ -47,6 +46,7 @@ export default function App() {
   >({});
   // 拖动态标记：拖动中高清 onBigDataUpdate 不应覆盖 UI（缩略图优先跟手）。
   const scrubbingRef = useRef(false);
+  const [, setScrubbing] = useState(false);
 
   // UI 状态（由 rAF 轮询从引擎回读）。
   const [time, setTime] = useState(0);
@@ -77,6 +77,13 @@ export default function App() {
   // 前端不硬编码图层列表——高精/轻图各自的图层（含轻图 road/lane/crosswalk 等）据此
   // 动态生成显隐复选框。新下发的图层默认可见并同步到引擎。
   const [layerDefs, setLayerDefs] = useState<LayerDef[]>([]);
+  // 显示策略由传输架构决定：Desktop FFI 本机无网络瓶颈，原图优先；
+  // Web/WS 跨机部署带宽有限，以全量缩略图缓存为中心显示。
+  const [imageDisplayMode] = useState<"original" | "thumbnail">(
+    () => (isTauri() && !new URLSearchParams(window.location.search).get("ws")
+      ? "original"
+      : "thumbnail"),
+  );
 
   const onLayerDefs = (defs: LayerDef[]) => {
     setLayerDefs(defs);
@@ -124,11 +131,37 @@ export default function App() {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // Debug 模式解析（仅开启时输出性能诊断，打包默认关闭）：
+  //   桌面端以 Tauri 侧 ffi_is_debug 为准（debug 构建 / VIZ_DEBUG / --debug）；
+  //   浏览器端 ?debug=1 开启；dev 构建默认开启，vite build 打包自动关闭。
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let enabled = import.meta.env.DEV;
+      if (isTauri()) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          if (!cancelled) enabled = enabled || (await invoke<boolean>("ffi_is_debug"));
+        } catch {
+          // 外壳命令不可用时仅保留 dev 默认值。
+        }
+      } else {
+        enabled =
+          enabled || new URLSearchParams(window.location.search).get("debug") === "1";
+      }
+      if (!cancelled) setDebugEnabled(enabled);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // 初始化引擎：优先 Three.js 渲染，失败回退 stream，再回退 mock。
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const canvas = canvasRef.current!;
+      const preferThumbnails = imageDisplayMode === "thumbnail";
       const onStatus = (message: string, error = false) => {
         setStatus(message);
         setStatusError(error);
@@ -148,6 +181,7 @@ export default function App() {
           for (const [pendingChannel, image] of Object.entries(pending)) {
             const bytes = new Uint8Array(image.jpeg);
             const url = URL.createObjectURL(new Blob([bytes.buffer], { type: "image/jpeg" }));
+            if (image.seq !== undefined) noteBlobCreated(pendingChannel, image.seq);
             const prev = nextUrls[pendingChannel];
             if (prev) URL.revokeObjectURL(prev);
             nextUrls[pendingChannel] = url;
@@ -159,19 +193,39 @@ export default function App() {
         });
       };
       const onImage = (channel: string, jpeg: Uint8Array, _w: number, _h: number) => {
+        if (preferThumbnails) return; // 分离部署不在前端消费/解码原图，节省主线程与带宽。
         queueImageUpdate(channel, jpeg);
       };
       // 【大数据流】某 channel 的当前大数据帧被替换时回调：image 从引擎持有者取当前帧字节。
       const onBigDataUpdate = (channel: string, kind: "image" | "raw" | "thumbnail") => {
+        if (kind === "thumbnail") {
+          if (!preferThumbnails) return;
+          // 缩略图是 Web 模式的正常播放源，不只是拖动预览源。后台铺底每产出一帧，
+          // 就按当前引擎 playhead 就近取用，避免等待一个完整的原图才刷新。
+          const engine = engineRef.current;
+          const entry = engine?.getThumbnailEntry?.(channel, engine.getTime());
+          if (!entry) return;
+          setThumbEntries((entries) => {
+            const current = entries[channel];
+            if (current?.seq === entry.seq) return entries;
+            return { ...entries, [channel]: entry };
+          });
+          return;
+        }
+        if (preferThumbnails && kind === "image") return;
         if (kind !== "image") return;
         const cur = engineRef.current?.getCurrentBigData?.(channel);
         if (!cur) return;
+        noteBigDataArrival(channel, cur.seq);
         queueImageUpdate(channel, cur.payload, cur.seq);
-        // 松手后继续保留最后一张缩略图，直到同一源图像的高清帧到达；
-        // 旧高清或同代次的在途帧不能提前撤下缩略图。
+        // 拖动中保留缩略图；松手后等高清时间追上缩略图时间再切回。
         setThumbEntries((entries) => {
           const thumb = entries[channel];
-          if (!thumb || !shouldReleaseThumbnail(thumb.seq, cur.seq)) return entries;
+          if (!thumb) return entries;
+          // 拖动中缩略图必须保持跟手。松手后不再要求 seq 严格相等：HEVC 从 I 帧
+          // 重同步、图像丢帧或后续 seek 都可能跳过那一张源帧；只要高清时间已追上
+          // 缩略图对应时间，就切回高清。否则旧缩略图会永久盖住正在播放的相机。
+          if (scrubbingRef.current || cur.tSec + 1e-3 < thumb.tSec) return entries;
           const next = { ...entries };
           delete next[channel];
           return next;
@@ -305,12 +359,14 @@ export default function App() {
   };
   const onScrubStart = () => {
     scrubbingRef.current = true;
+    setScrubbing(true);
     engineRef.current?.setScrubbing?.(true);
   };
   // 先结束预览态，随后 PlaybackBar 用 onSeek 正式提交最终位置。
-  // 最后一张缩略图继续作为屏障，直到同源高清帧到达后按通道移除。
+  // 缩略图是否切换由 onBigDataUpdate 的高清时间判断，避免源序号被 seek 跳过。
   const onScrubEnd = () => {
     scrubbingRef.current = false;
+    setScrubbing(false);
     engineRef.current?.setScrubbing?.(false);
   };
   const onSpeed = (s: number) => engineRef.current?.setSpeed(s);
@@ -353,6 +409,16 @@ export default function App() {
         delete n[channel];
         return n;
       });
+      setThumbEntries((m) => {
+        const n = { ...m };
+        delete n[channel];
+        return n;
+      });
+      setCameraSeqs((m) => {
+        const n = { ...m };
+        delete n[channel];
+        return n;
+      });
     }
   };
   const onToggleLayer = (id: string, v: boolean) => {
@@ -370,6 +436,13 @@ export default function App() {
   };
   const onUploadFile = async () => {
     if (!localFile || !engineRef.current?.uploadFile) return;
+    // 换源前清掉旧流显示状态；缩略图 blobUrl 由引擎 thumbnailStore 清理/回收。
+    pendingImagesRef.current = {};
+    Object.values(cameraUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    cameraUrlsRef.current = {};
+    setCameraUrls({});
+    setThumbEntries({});
+    setCameraSeqs({});
     setUploading(true);
     setUploadProgress(0);
     setStatusError(false);
@@ -387,6 +460,12 @@ export default function App() {
     const name = fileName.trim();
     if (!name || !engineRef.current?.openByName) return;
     setStatusError(false);
+    pendingImagesRef.current = {};
+    Object.values(cameraUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    cameraUrlsRef.current = {};
+    setCameraUrls({});
+    setThumbEntries({});
+    setCameraSeqs({});
     engineRef.current.openByName(name);
   };
   // Tauri 桌面：原生对话框选 .mcap，取文件名填入输入框并直接经统一入口打开
@@ -397,6 +476,12 @@ export default function App() {
       if (!picked) return;
       setFileName(picked);
       setStatusError(false);
+      pendingImagesRef.current = {};
+      Object.values(cameraUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+      cameraUrlsRef.current = {};
+      setCameraUrls({});
+      setThumbEntries({});
+      setCameraSeqs({});
       engineRef.current?.openByName?.(picked);
     } catch (error) {
       setStatusError(true);
@@ -572,15 +657,23 @@ export default function App() {
       <main className="viewport">
         <canvas ref={canvasRef} className="viz-canvas" />
         {imageDefs
-          .filter((d) => cameraOn.has(d.id) && (thumbEntries[d.id] || cameraUrls[d.id]))
+          .filter((d) => cameraOn.has(d.id))
           .map((d, i) => (
             <CameraOverlay
               key={d.id}
               channelId={d.id}
               index={i}
-              src={thumbEntries[d.id]?.blobUrl || cameraUrls[d.id]!}
+              src={
+                imageDisplayMode === "thumbnail"
+                  ? thumbEntries[d.id]?.blobUrl ?? cameraUrls[d.id]
+                  : cameraUrls[d.id] ?? thumbEntries[d.id]?.blobUrl
+              }
               title={d.label || d.id}
-              seq={thumbEntries[d.id]?.seq ?? cameraSeqs[d.id]}
+              seq={
+                imageDisplayMode === "thumbnail"
+                  ? thumbEntries[d.id]?.seq ?? cameraSeqs[d.id]
+                  : cameraSeqs[d.id] ?? thumbEntries[d.id]?.seq
+              }
             />
           ))}
       </main>

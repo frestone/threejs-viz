@@ -21,6 +21,23 @@ fn lock_session<'a>(
         .map_err(|_| "FFI 会话状态锁已损坏".to_string())
 }
 
+// Debug 模式解析：VIZ_DEBUG 环境变量（1/true/on/yes，大小写不敏感）或
+// 命令行 --debug 任一开启即视为 Debug 模式。打包/生产默认关闭。
+fn env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+fn debug_enabled() -> bool {
+    // debug 构建（tauri dev / tauri build --debug）默认开启，便于开发期排查；
+    // release 打包默认关闭，仅显式 VIZ_DEBUG=1 或 --debug 才开启。
+    cfg!(debug_assertions)
+        || std::env::var("VIZ_DEBUG").map(|v| env_truthy(&v)).unwrap_or(false)
+        || std::env::args().any(|arg| arg == "--debug")
+}
+
 fn with_session(
     state: &State<'_, FfiState>,
     action: impl FnOnce(&ffi::VizSession),
@@ -141,13 +158,67 @@ fn ffi_close(state: State<'_, FfiState>) -> Result<(), String> {
 // 前端性能诊断日志转发到进程 stderr，与后端 [viz_ffi] 日志汇聚到同一处（终端/nohup.out）。
 #[tauri::command]
 fn ffi_log(line: String) {
+    if !debug_enabled() {
+        return; // 仅 Debug 模式转发，避免非调试场景的 IPC/输出开销
+    }
     eprintln!("[frontend] {line}");
+}
+
+// 前端查询 Debug 模式状态：开启时才允许 perf 落盘与诊断日志。
+#[tauri::command]
+fn ffi_is_debug() -> bool {
+    debug_enabled()
+}
+
+// 前端图像各阶段耗时批量落盘（到达→Blob→<img> onLoad）。
+// 目录与后端一致：VIZ_PERF_LOG 指定，默认 $HOME/threejs-viz-perf。
+// 返回文件路径，前端仅首次打印一次，便于定位产物。
+fn perf_log_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("VIZ_PERF_LOG") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return std::path::PathBuf::from(profile).join("threejs-viz-perf");
+        }
+    }
+    #[cfg(not(windows))]
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home).join("threejs-viz-perf");
+        }
+    }
+    std::env::temp_dir().join("threejs-viz-perf")
+}
+
+#[tauri::command]
+fn ffi_perf_log(batch: String) -> Result<String, String> {
+    if !debug_enabled() {
+        return Ok(String::new()); // 非 Debug 模式不落盘
+    }
+    use std::io::Write;
+    let dir = perf_log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("frontend_image.csv");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(batch.as_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 保持 C ABI 符号从实际运行路径可达，避免 release 链接时被 --gc-sections 回收。
     ffi::ensure_linked();
+    // Debug 模式（VIZ_DEBUG / --debug）：仅开启时后端输出性能诊断，默认关闭。
+    ffi::VizSession::set_debug(debug_enabled());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(FfiState(Mutex::new(None)))
@@ -165,6 +236,8 @@ pub fn run() {
             ffi_set_playhead,
             ffi_close,
             ffi_log,
+            ffi_is_debug,
+            ffi_perf_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building threejs-viz desktop shell")

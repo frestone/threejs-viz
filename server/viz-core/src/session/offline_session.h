@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -66,6 +67,7 @@ public:
     void SetSpeed(double speed) override;
     void StartPrefetch() override;
     void SetImageSubscription(const std::string& channel, bool enabled) override;
+    void SetImageDeliveryMode(viz::transport::ImageDeliveryMode mode) override;
     void SetPointCloudSubscription(const std::string& channel, bool enabled) override;
     void SetRawDataSubscription(const std::string& channel, bool enabled) override;
     void SetPlayhead(double timeSec, uint64_t generation) override;
@@ -95,16 +97,33 @@ private:
     // mu_ 分离）访问解码器/缓存，不阻塞 seek/pause 等播放控制。
     void BigDataRun();
 
-    // GOP 感知解码：确保从关键帧(I 帧)起始解码，避免从 P 帧中途起始产生花屏。
-    // 先查 imageCache_ 命中直返；否则对本条 HEVC 消息判别——若非 I 帧起始且解码器无有效
-    // 参考帧状态则跳过（不缓存花屏）。命中/成功解码写 outJpeg/outW/outH 返回 true。
-    // I/P 判别见 gop_index.h IsHevcIFrame（移植 xmonitor image_util.h IsIFrame）。
-    // 调用方须持 decodeMu_。
-    // cacheOnly=true 时仅查图像缓存命中即返，不喂解码器（用于跨轮避免污染 DPB）。
-    bool DecodeToTargetViaGop(const std::string& channel, const uint8_t* data,
-                              int size, uint64_t msgLogTimeNs,
-                              std::vector<uint8_t>& outJpeg, int& outW, int& outH,
-                              bool cacheOnly = false);
+    // 【图像链路·顺序窗口读取】每通道维护一段「时间升序原始图像消息」滑动窗口，
+    // 连续播放时只向后增量读取新增消息（ReadImageMessagesRange(back+1, target)），
+    // 而不是每个 playhead 上报都调用 ReadImageMessagesUpTo(0, target) 全量扫描
+    // （原实现为 O(已播放时长)，是实时播放卡顿的主要中间环节）。
+    // 同时按窗口内位置顺序补喂解码器：只要目标帧位于上次已喂帧之后且窗口连续，
+    // 就把中间缺失帧依次喂入（不 Flush、不重解 GOP），使 25/30fps 图像在前端
+    // ~80ms 一次的 playhead 上报节奏下仍能逐帧连续解码；仅窗口断层/回退 seek 时
+    // 才回退到「最近 I 帧 + Flush + 连续重解」。
+    // 增量路径会把 [上次已喂, 目标] 之间的每一帧都解码并返回（而不是只返回目标帧），
+    // 否则相机图像输出频率会被前端 playhead 上报频率(~12.5Hz)封顶，30fps 素材仍显卡顿。
+    // 回退/seek 的 GOP 重建路径只返回目标帧，避免把过去 GOP 的中间帧倒灌到前端。
+    // readUs/decodeUs/feedFrames/gopReload 输出各阶段耗时(微秒)与喂帧数，供耗时文件分析。
+    struct DecodedImageEmit {
+        uint64_t logTimeNs = 0;
+        uint32_t seq = 0;
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> jpeg;
+    };
+    bool AcquireImageFrames(const std::string& channel, const std::string& topic,
+                            uint64_t targetNs,
+                            std::vector<DecodedImageEmit>* outFrames,
+                            uint64_t* readUs, uint64_t* decodeUs,
+                            uint32_t* feedFrames, bool* gopReload,
+                            uint64_t* hevcDecodeUs = nullptr,
+                            uint64_t* scaleUs = nullptr,
+                            uint64_t* jpegEncodeUs = nullptr);
 
     // 按帧号惰性组装单帧（LRU 缓存），未命中则经 adapter_ 读取。调用方须持 mu_。
     std::shared_ptr<const viz::Frame> GetFrameLocked(size_t index);
@@ -129,10 +148,14 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
 
-    // 解码器相关结构(imageDecoders_/imageCache_/subscribedImages_)专用锁。
-    // 与 mu_ 分离:发帧线程锁外(不持 mu_)解码时持 decodeMu_,不阻塞 seek/pause/倍速等
-    // 播放状态控制。Seek/SetImageSubscription 改这些结构时须同时持两把锁。
-    std::mutex decodeMu_;
+    // 解码器相关结构(imageDecoders_/imageCache_/subscribedImages_)专用状态锁。
+    // 与 mu_ 分离:多路相机解码任务可同时持 shared_lock 访问各自通道状态;
+    // Seek/SetImageSubscription/换代清理用 exclusive_lock 安全释放或重建状态。
+    // 每个通道串行锁(见 imageDecodeLocks_)串行化主流任务与订阅/换代变更。
+    // 缩略图与主图使用独立 HEVC 解码器实例，低清铺底只取 shared 状态锁，
+    // 防止长批次铺底在同通道锁内饿死实时主流。
+    std::shared_mutex decodeMu_;
+    std::map<std::string, std::unique_ptr<std::mutex>> imageDecodeLocks_;
 
     // 数据接入适配器（本地/S3 统一）。open 时创建，持有其 meta 与场景配置。
     std::unique_ptr<viz::access::IDataAccessAdapter> adapter_;
@@ -153,6 +176,15 @@ private:
     // 空则不注入，零成本。默认不下发，仅前端勾选订阅后按段拉取。
     std::set<std::string> subscribedPointClouds_;
     std::set<std::string> subscribedRawData_;
+    // 图像独立流质量。ThumbnailOnly 时 BigDataRun 不再解码/发送高清流，只由后台
+    // 缩略图铺底线程产出低清缓存；OriginalOnly 时关闭缩略图铺底，避免双流抢 CPU。
+    std::atomic<viz::transport::ImageDeliveryMode> imageDeliveryMode_{
+        viz::transport::ImageDeliveryMode::Thumbnail};
+    // 播放线程快速判据：是否存在需要持 decodeMu_ 才能注入的内联大数据订阅
+    // （点云/RawData）。图像已迁出内联路径，仅订阅图像时播放线程无需触碰 decodeMu_，
+    // 否则会被 BigDataRun 的一次图像解码(可长达百毫秒)阻塞，几何供帧率骤降。
+    // 由 SetPointCloudSubscription/SetRawDataSubscription 在持 decodeMu_ 时更新。
+    std::atomic<bool> hasInlineSubscription_{false};
     // 每通道一个 HEVC 解码器实例（非线程安全，仅发帧线程用；订阅时惰性创建）。
     std::map<std::string, std::unique_ptr<viz::image::HevcDecoder>> imageDecoders_;
     // 每通道最近一次成功解码的图像消息缓存：图像帧率(约10-20fps)低于播放帧率，
@@ -166,11 +198,20 @@ private:
     };
     std::map<std::string, ImageCacheEntry> imageCache_;
 
+    // 每通道图像消息滑动窗口（时间升序）。连续播放时作为「增量读取 + 顺序补喂」的
+    // 单一数据源；喂完 target 后裁掉 target 之前的帧，内存上界 = 当前 GOP 剩余帧，
+    // 而不是从文件头开始的全序列。受 decodeMu_ 保护（与 imageDecoders_/imageCache_ 同）。
+    struct ImageWindow {
+        std::string topic;
+        std::vector<viz::access::IDataAccessAdapter::ImageMsg> msgs;
+    };
+    std::map<std::string, ImageWindow> imageWindows_;
+
     // 每通道解码器"最后连续喂入"的图像消息 logTime（0=未同步/需重解）。
-    // 【性能优化·连续播放增量解码】playhead 连续前进时，目标帧的直接前驱刚被喂过，
-    // 解码器 DPB 参考链天然完整——此时只需单帧增量喂入，无需 Flush 后从 I 帧重解整个
-    // GOP（原实现每帧从 I 帧重跑，GOP 越长越慢，是图像面板刷新慢的主因）。
-    // 仅当"目标帧的前一帧 logTime == 本值"才走增量；跳跃/seek 则回退 Flush+GOP 重解。
+    // 【性能优化·连续播放增量解码】playhead 连续前进时该值仍在顺序窗口内，说明
+    // 解码器 DPB 参考链完整——只需从它之后逐帧补喂到目标，无需 Flush 后从 I 帧重解
+    // 整个 GOP（原实现每帧从 I 帧重跑，GOP 越长越慢，是图像面板刷新慢的主因）。
+    // 窗口断层/回退/未同步时回退 Flush+GOP 重解。
     // 受 decodeMu_ 保护，与 imageDecoders_ 生命周期同步（订阅取消/换源时清理）。
     std::map<std::string, uint64_t> lastFedLogTimeNs_;
 
@@ -219,7 +260,10 @@ private:
         uint32_t seq = 0;
         std::vector<uint8_t> jpeg;
     };
-    static constexpr size_t kDecodedImageQueueCapacity = 8;
+    // 已解码高清图像发送队列：保留连续多帧（否则一批帧会被压成只剩最后一帧，
+    // 相机输出频率重新受 playhead 上报频率限制）。同通道积压超上限时丢最旧帧控延迟。
+    static constexpr size_t kDecodedImageQueueCapacity = 32;
+    static constexpr size_t kDecodedImageBacklogPerChannel = 4;
     void DecodedImageSendRun();
     void EnqueueDecodedImage(DecodedImage image);
 void ClearDecodedImages(const std::string& channel = {});
@@ -247,10 +291,20 @@ void ClearDecodedImages(const std::string& channel = {});
     std::map<std::string, std::unique_ptr<viz::image::HevcDecoder>> thumbnailDecoders_;
     // 每通道已生成缩略图的图像帧下标集合(去重,避免重复解码下发)。受 decodeMu_。
     std::map<std::string, std::set<size_t>> thumbnailDone_;
+    // 每通道全量图像消息缓存。旧实现每个 backfill 周期都调用
+    // ReadImageMessagesUpTo(UINT64_MAX)，在 zstd MCAP 上每 100ms 重复解压大 chunk，
+    // 会周期性阻塞播放线程。这里每代只读一次；保存共享指针，异步任务不拷贝大数据。
+    struct ThumbnailMsgCache {
+        uint64_t generation = 0;
+        std::shared_ptr<const std::vector<viz::access::IDataAccessAdapter::ImageMsg>>
+            msgs;
+    };
+    std::map<std::string, ThumbnailMsgCache> thumbnailMsgCache_;
 
     // 缩略图 backfill 线程主体:以 playheadSec_ 为中心向两侧扩散遍历图像帧,独立解码器
-    // GOP 感知解码→按通道配置 downscale→JPEG→SendBigDataFrame(kind=2)。低优先级让路主流,
-    // playhead 跳变重排。无订阅/未打开时 cv_ 休眠。用 decodeMu_ 访问解码器/去重集合。
+    // GOP 感知解码→按通道配置 downscale→JPEG→SendBigDataFrame(kind=2)。播放/暂停/
+    // 拖动态都持续铺底，形成可复用的全序列低清缓存。无订阅/未打开时 cv_ 休眠。
+    // 用 decodeMu_ 访问解码器/去重集合。
     void ThumbnailBackfillRun();
 
  // 对单个图像通道的全序列做连续 GOP 解码 + 按配置 downscale + 去重下发(kind=2)。

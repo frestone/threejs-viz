@@ -11,16 +11,21 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "viz/config.h"  // viz::SceneConfig / ImageChannelConfig(订阅式图像 topic 查表)
+#include "viz/debug.h"   // Debug 模式开关：仅开启时输出性能诊断(CSV/逐帧日志)
 
 namespace viz::session {
 
@@ -236,48 +241,179 @@ struct ImageStageTimers {
     uint64_t readCount = 0;
     uint64_t decodeMs = 0;
     uint64_t decodeCount = 0;
-    uint64_t incrementalHits = 0;
-    uint64_t incrementalMisses = 0;
-    uint64_t gopFallbackMs = 0;
     uint64_t gopFallbackCount = 0;
     uint64_t enqueueMs = 0;
     uint64_t sendMs = 0;
     uint64_t sendCount = 0;
+    uint64_t feedFramesTotal = 0;   // 累计喂入解码器的帧数(含中间参考帧)
+    uint64_t jpegBytesTotal = 0;    // 累计下发 JPEG 字节
+    uint64_t hevcUsTotal = 0;       // 累计 HEVC 解码微秒
+    uint64_t scaleUsTotal = 0;      // 累计 swscale 微秒
+    uint64_t jpegUsTotal = 0;       // 累计 JPEG 编码微秒
     uint64_t framesReported = 0;
     void Reset() { *this = ImageStageTimers{}; }
 };
 namespace {
+void AppendImageStageCsv(const std::string& line);
+uint64_t PerfWallMs();
 std::mutex& ImageStageTimersMu() {
     static std::mutex m;
     return m;
 }
-ImageStageTimers& TimersFor(const std::string& channel) {
+ImageStageTimers& TimersForLocked(const std::string& channel) {
     static std::unordered_map<std::string, ImageStageTimers> store;
-    std::lock_guard<std::mutex> lock(ImageStageTimersMu());
     return store[channel];
 }
-void ResetTimersFor(const std::string& channel) {
+
+template <typename Fn>
+void MutateImageTimers(const std::string& channel, Fn&& mutate) {
     std::lock_guard<std::mutex> lock(ImageStageTimersMu());
-    TimersFor(channel).Reset();
+    mutate(TimersForLocked(channel));
 }
+
 void LogImageStageSummary(const std::string& channel) {
     ImageStageTimers snapshot;
-    {
-        std::lock_guard<std::mutex> lock(ImageStageTimersMu());
-        snapshot = TimersFor(channel);
-        TimersFor(channel).Reset();
-    }
+    MutateImageTimers(channel, [&snapshot](ImageStageTimers& timers) {
+        snapshot = timers;
+        timers.Reset();
+    });
     if (snapshot.framesReported == 0) return;
     const uint64_t fr = snapshot.framesReported;
-    // 阶段日志已禁用(等待 IDE 终端恢复后再接入专用日志模块)。
-    // 计时字段仍按 Reset 周期累加,下次启用日志时直接把下方 VIZ_LOG_INFO 还原即可。
-    (void)fr;
-    (void)snapshot;
+    std::ostringstream os;
+    os << PerfWallMs() << ',' << channel << ',' << fr << ','
+       << (snapshot.readMs / fr) << ',' << (snapshot.decodeMs / fr) << ','
+       << (snapshot.feedFramesTotal / fr) << ',' << snapshot.gopFallbackCount << ','
+       << (snapshot.jpegBytesTotal / fr / 1024) << ','
+       << (snapshot.hevcUsTotal / fr / 1000) << ','
+       << (snapshot.scaleUsTotal / fr / 1000) << ','
+       << (snapshot.jpegUsTotal / fr / 1000);
+    AppendImageStageCsv(os.str());
 }
+
+// -----------------------------------------------------------------------------
+// 【性能测量·落盘】图像链路各阶段耗时文件（供离线分析播放卡顿）。
+//   目录：环境变量 VIZ_PERF_LOG 指定；未设置则 $HOME/threejs-viz-perf。
+//   文件：image_frames.csv  —— 每下发一帧一行，含读取/解码/喂帧数/GOP 回退。
+//         image_stages.csv  —— 每通道每 30 帧一行，含各阶段均值与 GOP 回退次数。
+// 进程启动时截断重写，并把目录打印到 stderr，便于定位产物。
+// -----------------------------------------------------------------------------
+std::filesystem::path PerfLogDir() {
+    if (const char* env = std::getenv("VIZ_PERF_LOG")) {
+        if (env[0] != '\0') return std::filesystem::path(env);
+    }
+#ifdef _WIN32
+    if (const char* up = std::getenv("USERPROFILE")) {
+        if (up[0] != '\0') return std::filesystem::path(up) / "threejs-viz-perf";
+    }
+#else
+    if (const char* home = std::getenv("HOME")) {
+        if (home[0] != '\0') return std::filesystem::path(home) / "threejs-viz-perf";
+    }
+#endif
+    return std::filesystem::temp_directory_path() / "threejs-viz-perf";
+}
+
+uint64_t PerfWallMs() {
+    static const auto kStart = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - kStart).count());
+}
+
+class PerfCsv {
+public:
+    PerfCsv(const std::string& fileName, const std::string& header) {
+        // 非 Debug 模式：不创建文件、不写表头、不打印路径。打包/生产热路径零开销。
+        if (!viz::DebugEnabled()) return;
+        std::error_code ec;
+        const auto dir = PerfLogDir();
+        std::filesystem::create_directories(dir, ec);
+        path_ = dir / fileName;
+        out_.open(path_, std::ios::out | std::ios::trunc);
+        if (out_) {
+            out_ << header << '\n';
+            out_.flush();
+            std::cerr << "[perf] image stage timing -> " << path_.string() << std::endl;
+        } else {
+            std::cerr << "[perf] cannot open timing file: " << path_.string() << std::endl;
+        }
+    }
+
+    void Write(const std::string& line) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!viz::DebugEnabled() || !out_) return;
+        out_ << line << '\n';
+        // 逐行 flush 会把解码线程串到磁盘同步 I/O 上。多通道 async 任务同时写
+        // loop/skip/frame 行时，采样栈会全部停在 fflush，图像链路被观测本身拖死。
+        // 改为低频 flush；析构/进程退出前冲刷，保证正常停止时文件完整。
+        ++linesSinceFlush_;
+        const auto now = std::chrono::steady_clock::now();
+        if (linesSinceFlush_ >= kFlushLines ||
+            now - lastFlush_ >= kFlushInterval) {
+            out_.flush();
+            linesSinceFlush_ = 0;
+            lastFlush_ = now;
+        }
+    }
+
+    ~PerfCsv() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (out_) out_.flush();
+    }
+
+private:
+    std::mutex mu_;
+    std::filesystem::path path_;
+    std::ofstream out_;
+    uint64_t linesSinceFlush_ = 0;
+    std::chrono::steady_clock::time_point lastFlush_ =
+        std::chrono::steady_clock::now();
+    static constexpr uint64_t kFlushLines = 256;
+    static constexpr std::chrono::milliseconds kFlushInterval{250};
+};
+
+PerfCsv& ImageFrameCsv() {
+    static PerfCsv csv("image_frames.csv",
+                       "wall_ms,channel,gen,target_t,seq,emit_frames,read_us,"
+                       "decode_us,hevc_us,scale_us,jpeg_us,feed_frames,gop_reload,"
+                       "jpeg_bytes");
+    return csv;
+}
+
+PerfCsv& ImageStageCsv() {
+    static PerfCsv csv("image_stages.csv",
+                       "wall_ms,channel,frames,avg_read_ms,avg_decode_ms,"
+                       "avg_feed_frames,gop_reloads,avg_jpeg_kb,avg_hevc_ms,"
+                       "avg_scale_ms,avg_jpeg_ms");
+    return csv;
+}
+
+PerfCsv& ImageDiagCsv() {
+    static PerfCsv csv("image_diag.csv",
+                       "wall_ms,event,channel,gen,playhead_t,seq,target_t,"
+                       "read_us,decode_us,hevc_us,scale_us,jpeg_us,fed_frames,reason");
+    return csv;
+}
+
+void AppendImageStageCsv(const std::string& line) { ImageStageCsv().Write(line); }
+
+// 会话启动时显式触碰两个 CSV，确保文件与表头立即存在（否则要等第一帧图像才创建）。
+void EnsurePerfLogsInitialized() {
+    if (!viz::DebugEnabled()) return;  // 非 Debug 模式不产生任何诊断文件
+    (void)ImageFrameCsv();
+    (void)ImageStageCsv();
+    (void)ImageDiagCsv();
+    // 二进制/源码一致性标记。复测“问题依旧”时先看 image_diag.csv 首行：
+    // 若没有该标记，说明运行的不是当前构建，应先重建再分析日志。
+    ImageDiagCsv().Write(
+        "0,startup,global,0,0,0,0,0,0,0,0,0,0,"
+        "pipeline=2026-09-19-image-catchup-v2");
+}
+
 }  // namespace
 
 
 OfflineSession::OfflineSession(viz::transport::IFrameSink* sink) : sink_(sink) {
+    EnsurePerfLogsInitialized();
     worker_ = std::thread([this] { Run(); });
     bigDataWorker_ = std::thread([this] { BigDataRun(); });
     decodedImageSendWorker_ = std::thread([this] { DecodedImageSendRun(); });
@@ -344,9 +480,10 @@ void OfflineSession::OpenWithAdapter(
     }
     if (prefetchWorker_.joinable()) prefetchWorker_.join();
     {
+        // 【锁序】统一先 decodeMu_ 再 mu_：BigDataRun 持 decodeMu_ 解码时内部要读 adapter_(取 mu_)，
+        // 若此处反向加锁会与其形成 AB-BA 死锁（播放中切换相机订阅时触发）。
+        std::lock_guard<std::shared_mutex> dlock(decodeMu_);
         std::lock_guard<std::mutex> lock(mu_);
-        // 替换 adapter_ 与清解码器/图像缓存须持 decodeMu_:发帧线程锁外解码时用到它们。
-        std::lock_guard<std::mutex> dlock(decodeMu_);
         adapter_ = std::move(adapter);
         meta_ = adapter_->GetMeta();
         ClearFrameCacheLocked();
@@ -358,11 +495,13 @@ void OfflineSession::OpenWithAdapter(
         // 否则首帧非 I 帧时,新码流的 msgs[size-2].logTimeNs 可能恰好撞上陈旧值,
         // 误命中增量单帧直解(新码流解码器 DPB 空,会花屏)。
         lastFedLogTimeNs_.clear();
+        imageWindows_.clear();  // 换源后旧码流的顺序窗口失效
         gopIndex_.clear();  // 换源后旧码流 GOP I 帧索引失效，下次订阅重建
         // 换源后缩略图解码器/去重集合失效,全部清空(下次 backfill 重建重扫)。
         thumbnailDecoders_.clear();
         thumbnailDone_.clear();
-        // 换源后为仍订阅的通道重建解码器,否则 BigDataRun 走 DecodeToTargetViaGop 找不到解码器会丢图。
+        thumbnailMsgCache_.clear();
+        // 换源后为仍订阅的通道重建解码器,否则 BigDataRun 取帧时找不到解码器会丢图。
         for (const auto& ch : subscribedImages_) {
             imageDecoders_.emplace(
                 ch, std::make_unique<viz::image::HevcDecoder>(ch));
@@ -390,9 +529,9 @@ void OfflineSession::OpenWithAdapter(
 }
 
 void OfflineSession::Seek(double timeSec, uint64_t generation) {
+    // 【锁序】先 decodeMu_ 再 mu_（与 BigDataRun 一致，见 AcquireImageFrames 内取 adapter_）。
+    std::lock_guard<std::shared_mutex> dlock(decodeMu_);
     std::lock_guard<std::mutex> lock(mu_);
-    // 解码器/缓存受 decodeMu_ 保护(发帧线程锁外解码时持有它);此处 Flush/清缓存须同持。
-    std::lock_guard<std::mutex> dlock(decodeMu_);
     if (!adapter_ || !opened_) return;
     playbackTime_ = std::clamp(timeSec, 0.0, meta_.durationSec);
     frameIndex_ = adapter_->IndexAtTime(playbackTime_);
@@ -408,6 +547,8 @@ void OfflineSession::Seek(double timeSec, uint64_t generation) {
         if (dec) dec->Flush();
     }
     imageCache_.clear();  // seek 后旧参考帧失效，缓存 JPEG 一并作废
+    imageWindows_.clear();  // seek 造成时间轴不连续：清顺序窗口，下次回退到最近 I 帧重读
+    lastFedLogTimeNs_.clear();
     ClearDecodedImages();
     cv_.notify_all();
 }
@@ -459,16 +600,20 @@ void OfflineSession::PrefetchRun() {
             std::unique_lock<std::mutex> lock(mu_);
             // 停止/换代/关闭：退出预取。
             if (stopped_ || prefetchStop_ || generation_ != myGen) {
-                std::cerr << "[viz_ffi][prefetch] EXIT idx=" << idx
-                          << "/" << frameCount
-                          << " stopped=" << stopped_
-                          << " prefetchStop=" << prefetchStop_
-                          << " gen=" << generation_ << " myGen=" << myGen << '\n';
+                if (viz::DebugEnabled()) {
+                    std::cerr << "[viz_ffi][prefetch] EXIT idx=" << idx
+                              << "/" << frameCount
+                              << " stopped=" << stopped_
+                              << " prefetchStop=" << prefetchStop_
+                              << " gen=" << generation_ << " myGen=" << myGen << '\n';
+                }
                 break;
             }
             if (idx >= frameCount) {
-                std::cerr << "[viz_ffi][prefetch] DONE idx=" << idx
-                          << "/" << frameCount << '\n';
+                if (viz::DebugEnabled()) {
+                    std::cerr << "[viz_ffi][prefetch] DONE idx=" << idx
+                              << "/" << frameCount << '\n';
+                }
                 break;      // 已全量预取完成
             }
             frame = GetFrameLocked(idx);       // 复用播放线程的 LRU 组帧逻辑
@@ -482,7 +627,7 @@ void OfflineSession::PrefetchRun() {
         if (sent) {
             idx += 1;                          // 成功入队才推进游标
             // [perf-diag] 预取供帧进度：每 50 帧打印一次，定位后端是否卡在早期帧。
-            if (idx % 50 == 0 || idx == frameCount) {
+            if (viz::DebugEnabled() && (idx % 50 == 0 || idx == frameCount)) {
                 std::cerr << "[viz_ffi][prefetch] idx=" << idx
                           << "/" << frameCount
                           << " t=" << frame->t() << '\n';
@@ -501,45 +646,261 @@ void OfflineSession::PrefetchRun() {
     }
 }
 
-// GOP 感知解码：确保从 I 帧起始解码，避免 P 帧中途起始花屏。调用方须持 decodeMu_。
-bool OfflineSession::DecodeToTargetViaGop(const std::string& channel,
-                                          const uint8_t* data, int size,
-                                          uint64_t msgLogTimeNs,
-                                          std::vector<uint8_t>& outJpeg,
-                                          int& outW, int& outH,
-                                          bool cacheOnly) {
-    // 1) 命中缓存直返（同一图像消息被多帧/多轮引用，避免重复喂解码器触发 Duplicate POC）。
-    auto& cache = imageCache_[channel];
-    if (msgLogTimeNs != 0 && msgLogTimeNs == cache.logTimeNs && !cache.jpeg.empty()) {
-        outJpeg = cache.jpeg;
-        outW = static_cast<int>(cache.width);
-        outH = static_cast<int>(cache.height);
-        return true;
+// 顺序窗口取帧：连续播放时只读新增消息、只喂新增帧；增量路径返回区间内每一帧
+// （保证 30fps 相机在前端 ~12.5Hz 上报节奏下仍按源帧率出图）。调用方须持 decodeMu_。
+bool OfflineSession::AcquireImageFrames(
+    const std::string& channel, const std::string& topic, uint64_t targetNs,
+    std::vector<DecodedImageEmit>* outFrames, uint64_t* readUs, uint64_t* decodeUs,
+    uint32_t* feedFrames, bool* gopReload, uint64_t* hevcDecodeUs,
+    uint64_t* scaleUs, uint64_t* jpegEncodeUs) {
+    using namespace std::chrono;
+    if (outFrames) outFrames->clear();
+    if (readUs) *readUs = 0;
+    if (decodeUs) *decodeUs = 0;
+    if (feedFrames) *feedFrames = 0;
+    if (gopReload) *gopReload = false;
+    if (hevcDecodeUs) *hevcDecodeUs = 0;
+    if (scaleUs) *scaleUs = 0;
+    if (jpegEncodeUs) *jpegEncodeUs = 0;
+    if (!outFrames) return false;
+
+    if (viz::DebugEnabled()) {
+        std::ostringstream row;
+        row << PerfWallMs() << ",acquire-enter," << channel << ",0,0,0,"
+            << static_cast<double>(targetNs) / 1e9;
+        ImageDiagCsv().Write(row.str());
     }
-    if (cacheOnly) return false;  // 仅探缓存，不喂解码器
-    auto it = imageDecoders_.find(channel);
-    if (it == imageDecoders_.end() || !it->second) return false;
-    // 2) 【防花屏关键约束】调用方保证喂帧顺序：目标为 I 帧或已从最近 I 帧连续喂到此帧。
-    //    首帧必须是 I 帧（IsHevcIFrame 判别）使解码器同步；其后 P 帧因 synced_ 已置可连续喂。
-    const bool isIFrame = viz::IsHevcIFrame(data, size);
-    const bool decoderSynced = it->second->IsSynced();
-    if (!isIFrame && !decoderSynced) {
-        // 非 I 帧且解码器未同步：跳过，绝不缓存花屏结果。等待下一个 I 帧重新同步。
-        return false;
+    auto& win = imageWindows_[channel];
+    if (win.topic != topic) {
+        win.topic = topic;
+        win.msgs.clear();
+        lastFedLogTimeNs_.erase(channel);
     }
-    int w = 0, h = 0;
-    std::vector<uint8_t> jpeg;
-    if (!it->second->DecodeToJpeg(data, size, &jpeg, &w, &h)) {
-        return false;
+
+    const auto tReadStart = steady_clock::now();
+    // 1) 窗口维护：空/回退 seek → 读有界回看段并扩展到含 I 帧；向前 → 仅读增量尾部。
+    // 【延迟上界】若目标落后窗口末尾超过 kMaxCatchupNs（管线跟不上、playhead 已跑远），
+    // 不追补整段——读取量与解码量会随差距线性增长形成雪崩（实测一次追补可读上百个
+    // 8.4MB chunk、耗时数十秒）。此时直接丢弃中间帧，从目标附近的 I 帧重新同步。
+    // 可通过 VIZ_IMAGE_MAX_CATCHUP_MS 调整；设 0 表示不跳帧、始终按序追补（延迟会累积）。
+    static const uint64_t kMaxCatchupNs = [] {
+        if (const char* env = std::getenv("VIZ_IMAGE_MAX_CATCHUP_MS")) {
+            const long v = std::atol(env);
+            if (v >= 0) return static_cast<uint64_t>(v) * 1000 * 1000;
+        }
+        return 500ULL * 1000 * 1000;  // 默认 500ms
+    }();
+    const bool tooFarBehind =
+        kMaxCatchupNs > 0 && !win.msgs.empty() &&
+        targetNs > win.msgs.back().logTimeNs &&
+        (targetNs - win.msgs.back().logTimeNs) > kMaxCatchupNs;
+    const bool needReload = win.msgs.empty() ||
+                            targetNs < win.msgs.front().logTimeNs ||
+                            tooFarBehind;
+    if (needReload) {
+        // 回看从 2s 起，找不到 I 帧就按 2 倍扩展，直到命中或回到文件头。
+        uint64_t lookbackNs = 2ULL * 1000 * 1000 * 1000;
+        while (true) {
+            const uint64_t startNs =
+                targetNs > lookbackNs ? targetNs - lookbackNs : 0;
+            std::vector<viz::access::IDataAccessAdapter::ImageMsg> loaded;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (adapter_) {
+                    adapter_->ReadImageMessagesRange(topic, startNs, targetNs, loaded);
+                }
+            }
+            bool hasIFrame = false;
+            for (const auto& m : loaded) {
+                if (viz::IsHevcIFrame(m.data.data(),
+                                      static_cast<int>(m.data.size()))) {
+                    hasIFrame = true;
+                    break;
+                }
+            }
+            if (!loaded.empty() && (hasIFrame || startNs == 0)) {
+                win.msgs = std::move(loaded);
+                break;
+            }
+            if (startNs == 0) {
+                win.msgs = std::move(loaded);
+                break;
+            }
+            lookbackNs *= 2;
+        }
+        lastFedLogTimeNs_.erase(channel);
+    } else if (targetNs > win.msgs.back().logTimeNs) {
+        // 顺序播放时一次多读一段。当前 MCAP 常见 8MB 级 zstd chunk，若每次只读
+        // 到当前 target，Summary 快路径也会为了几十毫秒的新增消息重复解压整个
+        // chunk（实测 read_us 约 160ms）。读-ahead 把解压成本摊到后续多个播放周期。
+        static constexpr uint64_t kImageReadAheadNs = 1000ULL * 1000 * 1000;
+        std::vector<viz::access::IDataAccessAdapter::ImageMsg> more;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (adapter_) {
+                adapter_->ReadImageMessagesRange(
+                    topic, win.msgs.back().logTimeNs + 1,
+                    targetNs + kImageReadAheadNs, more);
+            }
+        }
+        if (!more.empty()) {
+            win.msgs.insert(win.msgs.end(),
+                            std::make_move_iterator(more.begin()),
+                            std::make_move_iterator(more.end()));
+        }
     }
-    // 3) 写缓存供后续复用，并回填出参。
-    cache.logTimeNs = msgLogTimeNs;
-    cache.jpeg = jpeg;
-    cache.width = w > 0 ? static_cast<uint32_t>(w) : 0;
-    cache.height = h > 0 ? static_cast<uint32_t>(h) : 0;
-    outJpeg = std::move(jpeg);
-    outW = w;
-    outH = h;
+    const auto tReadEnd = steady_clock::now();
+    if (viz::DebugEnabled()) {
+        std::ostringstream row;
+        row << PerfWallMs() << ",read-exit," << channel << ",0,0,0,"
+            << static_cast<double>(targetNs) / 1e9 << ','
+            << duration_cast<microseconds>(tReadEnd - tReadStart).count()
+            << ",0,0,0,0," << win.msgs.size() << ",window";
+        ImageDiagCsv().Write(row.str());
+    }
+    if (readUs) {
+        *readUs = static_cast<uint64_t>(
+            duration_cast<microseconds>(tReadEnd - tReadStart).count());
+    }
+    if (win.msgs.empty()) return false;
+
+    // 2) 定位 <= targetNs 的最近一条消息（图像帧率通常低于渲染帧率）。
+    const auto after = std::upper_bound(
+        win.msgs.begin(), win.msgs.end(), targetNs,
+        [](uint64_t t, const viz::access::IDataAccessAdapter::ImageMsg& m) {
+            return t < m.logTimeNs;
+        });
+    if (after == win.msgs.begin()) return false;
+    const size_t targetIdx = static_cast<size_t>(after - win.msgs.begin()) - 1;
+    const uint64_t targetMsgNs = win.msgs[targetIdx].logTimeNs;
+
+    // 3) 同一消息已解码并下发过：返回空列表（图像帧率低于上报频率时常见），
+    //    调用方无需重复建 Blob/刷面板。
+    {
+        auto& cache = imageCache_[channel];
+        if (cache.logTimeNs == targetMsgNs && !cache.jpeg.empty()) {
+            return true;
+        }
+    }
+
+    auto dit = imageDecoders_.find(channel);
+    if (dit == imageDecoders_.end() || !dit->second) return false;
+    auto* dec = dit->second.get();
+    if (!dec->IsSynced()) lastFedLogTimeNs_.erase(channel);
+
+    // 4) 计算起点：上次连续喂到的消息仍在窗口内且早于目标时，只喂二者之间的新帧
+    //    （且这些帧都要下发）；否则（首帧/回退/断层）从目标之前最近的 I 帧 Flush 后
+    //    连续重解，但只下发目标帧，避免倒灌历史帧。
+    size_t startIdx = SIZE_MAX;
+    bool needFlush = false;
+    bool emitAll = false;  // true=增量区间逐帧下发；false=仅下发目标帧
+    auto lit = lastFedLogTimeNs_.find(channel);
+    if (lit != lastFedLogTimeNs_.end() && dec->IsSynced()) {
+        const auto found = std::lower_bound(
+            win.msgs.begin(), win.msgs.end(), lit->second,
+            [](const viz::access::IDataAccessAdapter::ImageMsg& m, uint64_t t) {
+                return m.logTimeNs < t;
+            });
+        if (found != win.msgs.end() && found->logTimeNs == lit->second) {
+            const size_t fedIdx = static_cast<size_t>(found - win.msgs.begin());
+            if (fedIdx < targetIdx) {
+                startIdx = fedIdx + 1;
+                emitAll = true;
+            }
+        }
+    }
+    if (startIdx == SIZE_MAX) {
+        needFlush = true;
+        for (size_t i = targetIdx + 1; i-- > 0;) {
+            if (viz::IsHevcIFrame(win.msgs[i].data.data(),
+                                  static_cast<int>(win.msgs[i].data.size()))) {
+                startIdx = i;
+                break;
+            }
+            if (i == 0) break;
+        }
+        if (startIdx == SIZE_MAX) return false;  // 窗口内无 I 帧：不下发花屏
+        if (gopReload) *gopReload = true;
+    }
+
+    // 5) 顺序喂包。中间参考帧必须喂入以维持 DPB 参考链，但只输出目标帧 JPEG。
+    const auto tDecodeStart = steady_clock::now();
+    if (viz::DebugEnabled()) {
+        std::ostringstream row;
+        row << PerfWallMs() << ",decode-enter," << channel << ",0,0,0,"
+            << static_cast<double>(targetMsgNs) / 1e9 << ",0,0,0,0,0,"
+            << (targetIdx - startIdx + 1) << ",index=" << startIdx << ":" << targetIdx;
+        ImageDiagCsv().Write(row.str());
+    }
+    if (needFlush) dec->Flush();
+    uint32_t fed = 0;
+    size_t targetOutIdx = SIZE_MAX;
+    uint64_t hevcDecodeTotalUs = 0;
+    uint64_t scaleTotalUs = 0;
+    uint64_t encodeTotalUs = 0;
+    for (size_t i = startIdx; i <= targetIdx; ++i) {
+        std::vector<uint8_t> tmp;
+        int tw = 0, th = 0;
+        viz::image::HevcDecoder::StageTiming stage;
+        const bool decoded =
+            dec->DecodeToJpeg(win.msgs[i].data.data(),
+                              static_cast<int>(win.msgs[i].data.size()), &tmp, &tw, &th,
+                              0, 0, &stage);
+        ++fed;
+        hevcDecodeTotalUs += stage.decodeUs;
+        scaleTotalUs += stage.scaleUs;
+        encodeTotalUs += stage.encodeUs;
+        if (!decoded || tmp.empty()) continue;
+        if (emitAll || i == targetIdx) {
+            DecodedImageEmit emit;
+            emit.logTimeNs = win.msgs[i].logTimeNs;
+            emit.seq = ParseRosHeaderSeq(win.msgs[i].data.data(),
+                                         win.msgs[i].data.size());
+            emit.width = tw;
+            emit.height = th;
+            emit.jpeg = std::move(tmp);
+            outFrames->push_back(std::move(emit));
+            if (i == targetIdx) targetOutIdx = outFrames->size() - 1;
+        }
+    }
+    const auto tDecodeEnd = steady_clock::now();
+    if (viz::DebugEnabled()) {
+        std::ostringstream row;
+        row << PerfWallMs() << ",decode-exit," << channel << ",0,0,"
+            << (outFrames && !outFrames->empty() ? outFrames->back().seq : 0) << ','
+            << static_cast<double>(targetMsgNs) / 1e9 << ','
+            << duration_cast<microseconds>(tDecodeEnd - tDecodeStart).count()
+            << ',' << hevcDecodeTotalUs << ',' << scaleTotalUs << ','
+            << encodeTotalUs << ',' << fed << ",frames=" << outFrames->size();
+        ImageDiagCsv().Write(row.str());
+    }
+    if (decodeUs) {
+        *decodeUs = static_cast<uint64_t>(
+            duration_cast<microseconds>(tDecodeEnd - tDecodeStart).count());
+    }
+    if (hevcDecodeUs) *hevcDecodeUs = hevcDecodeTotalUs;
+    if (scaleUs) *scaleUs = scaleTotalUs;
+    if (jpegEncodeUs) *jpegEncodeUs = encodeTotalUs;
+    if (feedFrames) *feedFrames = fed;
+
+    // 6) 无论目标帧是否当次产出，喂包动作都已发生：必须推进「已喂位置」并裁窗口，
+    //    否则下一轮会重复喂同一批包（HEVC Duplicate POC → 花屏/解码失败）。
+    lastFedLogTimeNs_[channel] = targetMsgNs;
+    if (targetIdx > 0) win.msgs.erase(win.msgs.begin(), win.msgs.begin() + targetIdx);
+    static constexpr size_t kMaxWindowMsgs = 512;
+    if (win.msgs.size() > kMaxWindowMsgs) {
+        win.msgs.erase(win.msgs.begin(), win.msgs.end() - kMaxWindowMsgs);
+    }
+
+    // 7) 写缓存（目标帧）。窗口裁剪已在上面完成，内存上界与已播放时长解耦。
+    if (targetOutIdx != SIZE_MAX) {
+        const auto& emitted = (*outFrames)[targetOutIdx];
+        auto& cache = imageCache_[channel];
+        cache.logTimeNs = targetMsgNs;
+        cache.jpeg = emitted.jpeg;
+        cache.width = emitted.width > 0 ? static_cast<uint32_t>(emitted.width) : 0;
+        cache.height = emitted.height > 0 ? static_cast<uint32_t>(emitted.height) : 0;
+    }
     return true;
 }
 
@@ -547,9 +908,19 @@ void OfflineSession::EnqueueDecodedImage(DecodedImage image) {
     {
         std::lock_guard<std::mutex> lock(decodedImageMu_);
         if (decodedImageSendStop_) return;
-        for (auto it = decodedImages_.begin(); it != decodedImages_.end();) {
-            if (it->channel == image.channel) it = decodedImages_.erase(it);
-            else ++it;
+        // 同通道积压超上限时丢最旧帧（控延迟），但保留连续多帧不下沉为单帧。
+        size_t sameChannel = 0;
+        for (const auto& pending : decodedImages_) {
+            if (pending.channel == image.channel) ++sameChannel;
+        }
+        while (sameChannel >= kDecodedImageBacklogPerChannel) {
+            for (auto it = decodedImages_.begin(); it != decodedImages_.end(); ++it) {
+                if (it->channel == image.channel) {
+                    decodedImages_.erase(it);
+                    --sameChannel;
+                    break;
+                }
+            }
         }
         while (decodedImages_.size() >= kDecodedImageQueueCapacity) {
             decodedImages_.pop_front();
@@ -588,7 +959,7 @@ void OfflineSession::DecodedImageSendRun() {
             if (stopped_ || bigDataStop_ || image.generation != bigDataGeneration_) continue;
         }
         {
-            std::lock_guard<std::mutex> lock(decodeMu_);
+            std::lock_guard<std::shared_mutex> lock(decodeMu_);
             if (subscribedImages_.find(image.channel) == subscribedImages_.end()) continue;
         }
         if (sink_) {
@@ -598,18 +969,23 @@ void OfflineSession::DecodedImageSendRun() {
                                     static_cast<uint32_t>(image.generation),
                                     /*kind=*/0, image.seq, payload);
             auto tSendEnd = std::chrono::steady_clock::now();
-            {
-                ImageStageTimers& timers = TimersFor(image.channel);
+            MutateImageTimers(image.channel, [&](ImageStageTimers& timers) {
                 timers.sendMs += std::chrono::duration_cast<std::chrono::milliseconds>(
                     tSendEnd - tSendStart).count();
                 timers.sendCount += 1;
-            }
+            });
         }
     }
 }
 
 void OfflineSession::BigDataRun() {
     using namespace std::chrono_literals;
+    // 记录本轮已处理的 playhead。wait 谓词纳入「playhead 前进」，使 SetPlayhead
+    // 的上报能立即唤醒本线程，而不是每轮固定等满 50ms；同时保留超时兜底。
+    double lastProcessedPlayhead = -1.0;
+    // 每通道最近已下发的 (gen, 图像 header.seq)。图像帧率通常低于 playhead 上报
+    // 频率，同一图像帧会多次命中缓存；去重后避免重复建 Blob/重复刷图像面板。
+    std::map<std::string, std::pair<uint64_t, uint32_t>> lastEmittedImage;
     while (true) {
         double playhead = 0.0;
         uint64_t myGen = 0;
@@ -629,9 +1005,15 @@ void OfflineSession::BigDataRun() {
         }
         // 锁外拷贝订阅集（持 decodeMu_ 读，避免与订阅变更竞争）。
         {
-            std::lock_guard<std::mutex> dlock(decodeMu_);
+            std::lock_guard<std::shared_mutex> dlock(decodeMu_);
             images = subscribedImages_;
             raws = subscribedRawData_;
+        }
+        // 分离部署（Thumbnail 模式）不下发高清流。这里直接清空图像任务，而不是解完
+        // 再丢：省掉 HEVC 解码、JPEG 编码和高清 BigData 消息对 WS 发送队列的挤占。
+        if (imageDeliveryMode_.load(std::memory_order_acquire) ==
+            viz::transport::ImageDeliveryMode::Thumbnail) {
+            images.clear();
         }
         if (images.empty() && raws.empty()) { std::this_thread::sleep_for(20ms); continue; }
 
@@ -639,195 +1021,220 @@ void OfflineSession::BigDataRun() {
         // （图像帧率低，单帧即覆盖窗口内可见图像）。逐通道读原始消息并解码/直取后下发。
         const double tStart = playhead;
         uint64_t logTimeNs = 0;
+        uint64_t t0Ns = 0;  // 首帧绝对 log_time：把图像消息时刻换算成时间轴秒
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (adapter_) {
                 const size_t fidx = adapter_->IndexAtTime(tStart);
                 logTimeNs = adapter_->FrameLogTimeNs(fidx);
+                t0Ns = adapter_->FrameLogTimeNs(0);
             }
         }
 
-        // === 图像通道：GOP 感知解码后走独立流下发 ===
-        for (const auto& channel : images) {
-            {  // 发送前校验代次：过期则整轮丢弃（丢旧不重试）。
-                std::lock_guard<std::mutex> lock(mu_);
-                if (stopped_ || bigDataStop_ || myGen != bigDataGeneration_) break;
-            }
-            std::string topic;
-            std::string codec;
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (!adapter_) break;
-                const auto& scene = adapter_->Scene();
-                for (const auto& ic : scene.imageChannels) {
-                    if (ic.id == channel) { topic = ic.topic; codec = ic.codec; break; }
-                }
-            }
-            if (topic.empty()) continue;
-            std::vector<uint8_t> raw;
-            uint64_t msgLogTimeNs = 0;
-            auto tReadStart = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (!adapter_ ||
-                    !adapter_->ReadImageMessage(topic, logTimeNs, raw,&msgLogTimeNs) ||
-                    raw.empty()) {
-                    continue;
-                }
-            }
-            auto tReadEnd = std::chrono::steady_clock::now();
-            {
-                ImageStageTimers& timers = TimersFor(channel);
-                timers.readMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-                    tReadEnd - tReadStart).count();
-                timers.readCount += 1;
-            }
-            // 原始消息为 ROS 风格 protobuf(顶层 field1=Header，Header field2=uint32 sequence_num)。
-            // 在此从原始字节提取 header.sequence_num 供面板诊断显示——须在解码前取，因非 HEVC 直通会 move(raw)。
-            const uint32_t imgSeq = ParseRosHeaderSeq(raw.data(), raw.size());
-            std::vector<uint8_t> jpeg;
-            int w = 0, h = 0;
-            auto tDecodeStart = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> dlock(decodeMu_);
-                if (codec == "hevc") {
-                    // 【花屏真根因·参考链断裂 · 架构级修复】
-                    // playhead 按墙钟跳跃前进(非逐帧连续)，每轮 BigDataRun 只取 IndexAtTime 的
-                    // 单帧。若沿用跨轮 synced_ 状态直解跳跃到达的 P 帧，其依赖的中间参考帧
-                    // (POC N)从未喂入解码器 DPB → "Could not find ref with POC N" → 花屏。
-                    // 因此【不信任跨轮解码器状态】：目标帧非 I 帧时，总是 Flush 清空 DPB，
-                    // 再从最近 I 帧【连续】喂到目标，保证每次目标解码 DPB 参考链完整。
-                    bool ok = false;
-                    // (a) 命中图像缓存直返(同一消息重复引用，避免重复喂解码器)。
-                    ok = DecodeToTargetViaGop(channel, raw.data(),
-                                              static_cast<int>(raw.size()),
-                                              msgLogTimeNs, jpeg, w, h,
-                                              /*cacheOnly=*/true);
-                    if (!ok) {
-                        const bool targetIsI =
-                            viz::IsHevcIFrame(raw.data(), static_cast<int>(raw.size()));
-                        if (targetIsI) {
-                            // (b) 目标本身是 I 帧：自带完整参考，先 Flush 再直解即可。
-                            auto dit = imageDecoders_.find(channel);
-                            if (dit != imageDecoders_.end() && dit->second) dit->second->Flush();
-                            ok = DecodeToTargetViaGop(channel, raw.data(),
-                                                      static_cast<int>(raw.size()),
-                                                      msgLogTimeNs, jpeg, w, h);
-                            // 【闭环增量判据】I 帧直解成功后必须写 lastFedLogTimeNs_,
-                            // 否则下一帧连续 P 帧无法命中增量路径(缺判据 → 误回退 GOP 重解)。
-                            if (ok) lastFedLogTimeNs_[channel] = msgLogTimeNs;
-                        } else {
-                            // (c) 目标非 I 帧：读 <=logTimeNs 升序序列，末条即 playhead 目标。
-                            std::vector<viz::access::IDataAccessAdapter::ImageMsg> msgs;
-                            bool got = false;
-                            {
-                                std::lock_guard<std::mutex> lock(mu_);
-                                got = adapter_ &&
-                                      adapter_->ReadImageMessagesUpTo(topic, logTimeNs, msgs);
-                            }
-                            if (got && !msgs.empty()) {
-                                auto dit = imageDecoders_.find(channel);
-                                viz::image::HevcDecoder* dec =
-                                    (dit != imageDecoders_.end()) ? dit->second.get() : nullptr;
-                                // 【性能优化·连续播放增量解码】playhead 连续前进时，目标帧的直接
-                                // 前驱(msgs[size-2])刚被喂过，解码器 DPB 参考链完整，只需单帧增量
-                                // 喂入即可，无需 Flush + 从 I 帧重解整个 GOP（原实现每帧从 I 帧重跑，
-                                // 是图像面板刷新慢的主因）。判据：解码器已 synced 且上次连续喂入的帧
-                                // logTime == 目标前一帧 logTime。
-                                bool incremental = false;
-                                if (dec && dec->IsSynced() && msgs.size() >= 2) {
-                                    auto lit = lastFedLogTimeNs_.find(channel);
-                                    if (lit != lastFedLogTimeNs_.end() &&
-                                        lit->second == msgs[msgs.size() - 2].logTimeNs) {
-                                        incremental = true;
-                                    }
-                                }
-                                if (incremental) {
-                                    {
-                                        ImageStageTimers& timers = TimersFor(channel);
-                                        timers.incrementalHits += 1;
-                                    }
-                                    std::vector<uint8_t> tmp;
-                                    int tw = 0, th = 0;
-                                    if (DecodeToTargetViaGop(channel, raw.data(),
-                                                             static_cast<int>(raw.size()),
-                                                             msgLogTimeNs, tmp, tw, th)) {
-                                        jpeg = std::move(tmp); w = tw; h = th; ok = true;
-                                        lastFedLogTimeNs_[channel] = msgLogTimeNs;
-                                    }
-                                }
-                                if (!ok) {
-                                    // 跳跃/seek 或未同步：末尾往前定位最近 I 帧，Flush 后连续重解。
-                                    {
-                                        ImageStageTimers& timers = TimersFor(channel);
-                                        timers.incrementalMisses += 1;
-                                    }
-                                    size_t startIdx = 0;
-                                    bool found = false;
-                                    for (size_t i = msgs.size(); i-- > 0;) {
-                                        if (viz::IsHevcIFrame(
-                                                msgs[i].data.data(),
-                                                static_cast<int>(msgs[i].data.size()))) {
-                                            startIdx = i;
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                    if (found) {
-                                        auto tGopStart = std::chrono::steady_clock::now();
-                                        // Flush 清空跳跃污染的 DPB，从 I 帧重建参考链。
-                                        if (dec) dec->Flush();
-                                        for (size_t i = startIdx; i < msgs.size(); ++i) {
-                                            std::vector<uint8_t> tmp;
-                                            int tw = 0, th = 0;
-                                            bool dok = DecodeToTargetViaGop(
-                                                channel, msgs[i].data.data(),
-                                                static_cast<int>(msgs[i].data.size()),
-                                                msgs[i].logTimeNs, tmp, tw, th);
-                                            if (dok) { jpeg = std::move(tmp); w = tw; h = th; ok = true; }
-                                        }
-                                        auto tGopEnd = std::chrono::steady_clock::now();
-                                        {
-                                            ImageStageTimers& timers = TimersFor(channel);
-                                            timers.gopFallbackMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                tGopEnd - tGopStart).count();
-                                            timers.gopFallbackCount += 1;
-                                        }
-                                        if (ok) lastFedLogTimeNs_[channel] = msgLogTimeNs;
-                                    }
-                                }
-                   }
+        // === 图像通道：顺序窗口增量读取 + GOP 感知连续解码，独立流下发 ===
+        // 每个 playhead 上报只做「读新增消息 + 喂新增帧」，不再每次全量扫描/整段 GOP 重解。
+        // 多路相机按通道并行：HEVC 解码器本身不可跨线程复用，因此每通道独立解码器，
+        // 并用 imageDecodeLocks_ 序列化同一通道的主流与缩略图解码。
+        if (!images.empty()) {
+            std::mutex emittedMu;
+            std::map<std::string, std::pair<uint64_t, uint32_t>> lastEmittedImage;
+            std::vector<std::future<void>> tasks;
+            tasks.reserve(images.size());
+            for (const auto& channel : images) {
+                tasks.push_back(std::async(std::launch::async, [this, channel, tStart,
+                                                                logTimeNs, t0Ns, myGen,
+                                                                &emittedMu, &lastEmittedImage] {
+                    {
+                        std::lock_guard<std::mutex> lock(mu_);
+                        if (stopped_ || bigDataStop_ || myGen != bigDataGeneration_) return;
+                    }
+                    if (viz::DebugEnabled()) {
+                        std::ostringstream row;
+                        row << PerfWallMs() << ",loop," << channel << ',' << myGen << ','
+                            << tStart << ",0," << static_cast<double>(logTimeNs) / 1e9;
+                        ImageDiagCsv().Write(row.str());
+                    }
+                    if (viz::DebugEnabled()) {
+                        std::ostringstream row;
+                        row << PerfWallMs() << ",task-before-mu," << channel << ',' << myGen << ','
+                            << tStart << ",0," << static_cast<double>(logTimeNs) / 1e9;
+                        ImageDiagCsv().Write(row.str());
+                    }
+                    std::string topic;
+                    std::string codec;
+                    {
+                        std::lock_guard<std::mutex> lock(mu_);
+                        if (!adapter_) return;
+                        const auto& scene = adapter_->Scene();
+                        for (const auto& ic : scene.imageChannels) {
+                            if (ic.id == channel) { topic = ic.topic; codec = ic.codec; break; }
                         }
                     }
-                    if (!ok || jpeg.empty()) {
-                        continue;  // 无 I 帧起点/解码失败：跳过不下发花屏
+                    if (viz::DebugEnabled()) {
+                        std::ostringstream row;
+                        row << PerfWallMs() << ",task-after-mu," << channel << ',' << myGen << ','
+                            << tStart << ",0," << static_cast<double>(logTimeNs) / 1e9
+                            << ",0,0,0,0,0," << topic.size() << ",topic";
+                        ImageDiagCsv().Write(row.str());
                     }
-                } else {
-                    jpeg = std::move(raw);  // jpeg/raw 直通
-                }
+                    if (topic.empty()) return;
+
+                    std::vector<DecodedImageEmit> emits;
+                    uint64_t readUs = 0;
+                    uint64_t decodeUs = 0;
+                    uint64_t hevcUs = 0;
+                    uint64_t scaleUs = 0;
+                    uint64_t jpegUs = 0;
+                    uint32_t fedFrames = 0;
+                    bool gopReload = false;
+                    bool ok = false;
+                    if (codec == "hevc") {
+                        if (viz::DebugEnabled()) {
+                            std::ostringstream row;
+                            row << PerfWallMs() << ",state-lock-wait," << channel
+                                << ',' << myGen << ',' << tStart << ",0,"
+                                << static_cast<double>(logTimeNs) / 1e9;
+                            ImageDiagCsv().Write(row.str());
+                        }
+                        // shared_lock 允许多个通道同时进入各自状态；同一通道由
+                        // channelLock 防止主流/缩略图并发使用同一个解码器。
+                        std::shared_lock<std::shared_mutex> stateLock(decodeMu_);
+                        if (viz::DebugEnabled()) {
+                            std::ostringstream row;
+                            row << PerfWallMs() << ",channel-lock-wait," << channel
+                                << ',' << myGen << ',' << tStart << ",0,"
+                                << static_cast<double>(logTimeNs) / 1e9;
+                            ImageDiagCsv().Write(row.str());
+                        }
+                        std::lock_guard<std::mutex> channelLock(
+                            *imageDecodeLocks_.at(channel));
+                        ok = AcquireImageFrames(channel, topic, logTimeNs, &emits,
+                                                &readUs, &decodeUs, &fedFrames,
+                                                &gopReload, &hevcUs, &scaleUs,
+                                                &jpegUs);
+                    } else {
+                        // 非 HEVC（jpeg/raw）直通：取 <= playhead 的最近一条原始消息。
+                        std::vector<uint8_t> raw;
+                        uint64_t msgLogTimeNs = 0;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        {
+                            std::lock_guard<std::mutex> lock(mu_);
+                            if (adapter_) {
+                                adapter_->ReadImageMessage(topic, logTimeNs, raw,
+                                                           &msgLogTimeNs);
+                            }
+                        }
+                        readUs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0).count());
+                        if (!raw.empty()) {
+                            DecodedImageEmit emit;
+                            emit.logTimeNs = msgLogTimeNs;
+                            emit.seq = ParseRosHeaderSeq(raw.data(), raw.size());
+                            emit.jpeg = std::move(raw);
+                            emits.push_back(std::move(emit));
+                            ok = true;
+                        }
+                    }
+                    if (!ok || emits.empty()) {
+                        // 无 I 帧起点/解码失败/解码器暂时无输出：不再静默吞掉。
+                        // 这是定位“图像播放若干秒后永久冻结”的关键诊断行。
+                        if (viz::DebugEnabled()) {
+                            std::ostringstream row;
+                            row << PerfWallMs() << ",skip," << channel << ',' << myGen << ','
+                                << tStart << ",0," << static_cast<double>(logTimeNs) / 1e9
+                                << ",0,0,0,0,0,0,decoder-or-gop";
+                            ImageDiagCsv().Write(row.str());
+                        }
+                        return;
+                    }
+                    auto tEnqStart = std::chrono::steady_clock::now();
+                    size_t emitted = 0;
+                    size_t jpegBytes = 0;
+                    uint32_t lastSeq = 0;
+                    for (auto& emit : emits) {
+                        if (emit.seq != 0) {
+                            std::lock_guard<std::mutex> emitLock(emittedMu);
+                            const auto prev = lastEmittedImage.find(channel);
+                            if (prev != lastEmittedImage.end() &&
+                                prev->second.first == myGen &&
+                                prev->second.second == emit.seq) {
+                                continue;
+                            }
+                            lastEmittedImage[channel] = {myGen, emit.seq};
+                        }
+                        const double tSec =
+                            (t0Ns > 0 && emit.logTimeNs >= t0Ns)
+                                ? static_cast<double>(emit.logTimeNs - t0Ns) / 1e9
+                                : tStart;
+                        jpegBytes += emit.jpeg.size();
+                        lastSeq = emit.seq;
+                        ++emitted;
+                        EnqueueDecodedImage(DecodedImage{
+                            channel, tSec, myGen, emit.seq, std::move(emit.jpeg)
+                        });
+                    }
+                    if (emitted == 0) return;
+                    auto tEnqEnd = std::chrono::steady_clock::now();
+                    // 阶段统计（30 帧汇总一次 image_stages.csv）与逐帧 image_frames.csv
+                    // 只在 Debug 模式累计/落盘：非 Debug 下连互斥锁与累计算术都不做。
+                    if (viz::DebugEnabled()) {
+                        bool shouldLogStageSummary = false;
+                        MutateImageTimers(channel, [&](ImageStageTimers& timers) {
+                            timers.readMs += readUs / 1000;
+                            timers.readCount += 1;
+                            timers.decodeMs += decodeUs / 1000;
+                            timers.decodeCount += 1;
+                            timers.enqueueMs += std::chrono::duration_cast<
+                                std::chrono::milliseconds>(tEnqEnd - tEnqStart).count();
+                            timers.feedFramesTotal += fedFrames;
+                            timers.jpegBytesTotal += jpegBytes;
+                            timers.hevcUsTotal += hevcUs;
+                            timers.scaleUsTotal += scaleUs;
+                            timers.jpegUsTotal += jpegUs;
+                            if (gopReload) timers.gopFallbackCount += 1;
+                            timers.framesReported += emitted;
+                            shouldLogStageSummary = timers.framesReported >= 30;
+                        });
+                        {
+                            std::ostringstream row;
+                            row << PerfWallMs() << ',' << channel << ',' << myGen << ','
+                                << tStart << ',' << lastSeq << ',' << emitted << ',' << readUs
+                                << ',' << decodeUs << ',' << hevcUs << ',' << scaleUs << ','
+                                << jpegUs << ',' << fedFrames << ',' << (gopReload ? 1 : 0)
+                                << ',' << jpegBytes;
+                            ImageFrameCsv().Write(row.str());
+                        }
+                        if (shouldLogStageSummary) {
+                            LogImageStageSummary(channel);
+                        }
+                    }
+                }));
             }
-            auto tDecodeEnd = std::chrono::steady_clock::now();
-            {
-                ImageStageTimers& timers = TimersFor(channel);
-                timers.decodeMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-                    tDecodeEnd - tDecodeStart).count();
-                timers.decodeCount += 1;
-            }
-            auto tEnqStart = std::chrono::steady_clock::now();
-            // 解码结果入有界最新帧队列；发送线程独立消费，传输背压不再阻塞后续解码。
-            EnqueueDecodedImage(DecodedImage{
-                channel, tStart, myGen, imgSeq, std::move(jpeg)
-            });
-            auto tEnqEnd = std::chrono::steady_clock::now();
-            {
-                ImageStageTimers& timers = TimersFor(channel);
-                timers.enqueueMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-                    tEnqEnd - tEnqStart).count();
-                timers.framesReported += 1;
-                if (timers.framesReported % 30 == 0) {
-                    LogImageStageSummary(channel);
-                }
-            }
+            for (auto& task : tasks) {
+                        // std::async 的返回值离开作用域会析构；异常必须显式接住，
+                        // 否则主循环会在 task.wait 后被重新抛出并静默结束整轮。
+                        try {
+                            task.get();
+                        } catch (const std::exception& error) {
+                            if (viz::DebugEnabled()) {
+                                std::ostringstream row;
+                                row << PerfWallMs() << ",exception,global," << myGen << ','
+                                    << tStart << ",0,0,0,0,0,0,0,0,0," << error.what();
+                                ImageDiagCsv().Write(row.str());
+                            }
+                            std::cerr << "[viz][bigdata] task exception: " << error.what()
+                                      << std::endl;
+                        } catch (...) {
+                            if (viz::DebugEnabled()) {
+                                std::ostringstream row;
+                                row << PerfWallMs() << ",exception,global," << myGen << ','
+                                    << tStart << ",0,0,0,0,0,0,0,0,0,unknown";
+                                ImageDiagCsv().Write(row.str());
+                            }
+                            std::cerr << "[viz][bigdata] task exception: unknown" << std::endl;
+                        }
+                    }
         }
 
         // === RawData 通道：原始字节直取下发（kind=1），不解码 ===
@@ -867,10 +1274,16 @@ void OfflineSession::BigDataRun() {
             }
         }
 
-        // 本轮处理完成后短休眠，等待下一次 playhead 上报唤醒（避免空转 CPU）。
+        // 本轮处理完成后等待下一次 playhead 前进或超时兜底：
+        //   * SetPlayhead 上报新位置 → 谓词为真，立即返回继续处理（消除 50ms 上限）。
+        //   * 播放暂停/无新上报 → 最多 50ms 后超时，仅做一次廉价的存在性检查。
         {
             std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait_for(lock, 50ms, [this] { return stopped_ || bigDataStop_; });
+            lastProcessedPlayhead = playhead;
+            cv_.wait_for(lock, 50ms, [this, lastProcessedPlayhead] {
+                return stopped_ || bigDataStop_ ||
+                       playheadSec_ > lastProcessedPlayhead + 1e-6;
+            });
             if (stopped_ || bigDataStop_) break;
         }
     }
@@ -919,19 +1332,25 @@ void OfflineSession::ThumbnailDecodeChannel(
         // 环形序中，从尾部绕回头部时会出现 P 帧不连续：等到下一个 I 帧再恢复解码。
         if (!synced && !isI) continue;
 
-        // 解码器状态管理 + downscale 解码（持 decodeMu_，与主流解码互斥）。
+        // 每帧短暂取 shared 状态锁。连续解码状态由 HEVC 解码器实例自身保存；
+        // 在两帧之间释放锁可让 Seek/SetImageSubscription 立即获得 exclusive 锁，
+        // 否则一次全量铺底会长时间阻塞订阅，表现为图像窗口迟迟不出现。
         std::vector<uint8_t> jpeg;
         int w = 0, h = 0;
         bool ok = false;
         const uint32_t seq = ParseRosHeaderSeq(m.data.data(), m.data.size());
         {
-            std::lock_guard<std::mutex> dlock(decodeMu_);
+            std::shared_lock<std::shared_mutex> stateLock(decodeMu_);
+            if (stopped_ || thumbnailStop_ || myGen != thumbnailGeneration_) return;
             // 已生成过该序号则跳过（去重），但仍需推进解码器状态以保参考链连续。
             auto& done = thumbnailDone_[channel];
             const bool already = done.count(seq) > 0;
             auto dit = thumbnailDecoders_.find(channel);
             if (dit == thumbnailDecoders_.end() || !dit->second) return;
             auto* dec = dit->second.get();
+            // 订阅取消/重订可能替换解码器实例；本地 synced 只表示遍历序有效。
+            // 新实例未同步时仍等待下一个 I 帧，避免把 P 帧喂进空 DPB。
+            if ((!synced || !dec->IsSynced()) && !isI) continue;
             if (isI) { dec->Flush(); synced = true; }
             ok = dec->DecodeToJpeg(m.data.data(), static_cast<int>(m.data.size()),
                                    &jpeg, &w, &h, thumbnailWidth, thumbnailHeight);
@@ -985,12 +1404,20 @@ void OfflineSession::ThumbnailBackfillRun() {
                        (opened_ && adapter_ && !subscribedImages_.empty());
             });
             if (stopped_ || thumbnailStop_) break;
+            // Desktop 原图模式不启动缩略图铺底：原图已是低延迟显示源，双流只会增加
+            // CPU/锁竞争。若运行时切换模式，下一次周期会按新模式继续。
+            if (imageDeliveryMode_.load(std::memory_order_acquire) ==
+                viz::transport::ImageDeliveryMode::Original) {
+                cv_.wait_for(lock, 100ms);
+                if (stopped_ || thumbnailStop_) break;
+                continue;
+            }
             playhead = playheadSec_;
             myGen = thumbnailGeneration_;
             thumbnailStarted_ = true;
         }
         {
-            std::lock_guard<std::mutex> dlock(decodeMu_);
+            std::lock_guard<std::shared_mutex> dlock(decodeMu_);
             images = subscribedImages_;
         }
         if (images.empty()) { std::this_thread::sleep_for(50ms); continue; }
@@ -1041,11 +1468,13 @@ void OfflineSession::ThumbnailBackfillRun() {
             }
         }
 
-        // 并发铺底: 限制最大并行度避免抢占主播放解码线程。
-        // 缩略图铺底让路本就保守(yield=2/sleep=5ms), 默认 max(2, hw/2) 取一半核数,
-        // 避免 6 通道全并发撑爆。
+        // 并发铺底: 暂停时放开到一半核数尽快预热全量缓存；播放态只允许 1 路，
+        // 避免 6+ 通道低清解码抢占高清 HEVC/CPU。
+        const bool isPaused = paused_;
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const size_t kMaxParallel = std::min<size_t>(metas.size(), std::max(2u, hw / 2));
+        const size_t kMaxParallel = isPaused
+            ? std::min<size_t>(metas.size(), std::max(2u, hw / 2))
+            : std::min<size_t>(metas.size(), size_t{1});
         const uint64_t playheadNs =
             t0 + static_cast<uint64_t>(std::llround(playhead * 1e9));
         std::vector<std::future<void>> futs;
@@ -1057,47 +1486,58 @@ void OfflineSession::ThumbnailBackfillRun() {
             }
             futs.push_back(std::async(std::launch::async,
                 [this, &meta = metas[i], t0, myGen, playheadNs] {
-                    // worker: 取 msgs(持 mu_ 调 adapter, 短锁) + 创建解码器 + 算 startPos。
-                    std::vector<viz::access::IDataAccessAdapter::ImageMsg> msgs;
+                    // worker: 优先复用本代全量消息缓存，避免每个 100ms 周期重读 MCAP。
+                    std::shared_ptr<const std::vector<viz::access::IDataAccessAdapter::ImageMsg>>
+                        msgsPtr;
                     {
-                        std::lock_guard<std::mutex> lock(mu_);
-                        if (!adapter_) return;
-                        if (!adapter_->ReadImageMessagesUpTo(meta.topic, UINT64_MAX, msgs)) {
-                            return;
+                        std::shared_lock<std::shared_mutex> stateLock(decodeMu_);
+                        const auto hit = thumbnailMsgCache_.find(meta.channel);
+                        if (hit != thumbnailMsgCache_.end() &&
+                            hit->second.generation == myGen) {
+                            msgsPtr = hit->second.msgs;
                         }
                     }
-                    if (msgs.empty()) return;
-
+                    if (!msgsPtr) {
+                        std::vector<viz::access::IDataAccessAdapter::ImageMsg> loaded;
+                        {
+                            std::lock_guard<std::mutex> lock(mu_);
+                            if (!adapter_ || thumbnailGeneration_ != myGen) return;
+                            if (!adapter_->ReadImageMessagesUpTo(meta.topic,
+                                                                 UINT64_MAX, loaded)) {
+                                return;
+                            }
+                        }
+                        if (loaded.empty()) return;
+                        msgsPtr = std::make_shared<
+                            const std::vector<viz::access::IDataAccessAdapter::ImageMsg>>(
+                            std::move(loaded));
+                        std::lock_guard<std::shared_mutex> stateLock(decodeMu_);
+                        if (thumbnailGeneration_ != myGen) return;
+                        thumbnailMsgCache_[meta.channel] = {myGen, msgsPtr};
+                    }
                     size_t startPos = 0;
+                    const auto& msgs = *msgsPtr;
+                    if (msgs.empty()) return;
                     for (size_t k = 0; k < msgs.size(); ++k) {
                         if (msgs[k].logTimeNs <= playheadNs) startPos = k; else break;
                     }
 
-                    {
-                        std::lock_guard<std::mutex> dlock(decodeMu_);
-                        if (thumbnailDecoders_.find(meta.channel) == thumbnailDecoders_.end()) {
-                            thumbnailDecoders_.emplace(
-                                meta.channel,
-                                std::make_unique<viz::image::HevcDecoder>(meta.channel));
-                        }
-                    }
-
+                    // ThumbnailDecodeChannel 每帧短暂取 shared 状态锁；
+                    // 这里绝不包住整段铺底，否则 Seek/订阅变更会等到全序列结束。
                     ThumbnailDecodeChannel(meta.channel, meta.topic,
                                             msgs, startPos, t0, myGen,
-       meta.thumbnailWidth, meta.thumbnailHeight);
+                                            meta.thumbnailWidth,
+                                            meta.thumbnailHeight);
                 }));
         }
         for (auto& f : futs) f.wait();  // 等待所有铺底完成再进入本轮休眠
 
-        // 本轮扫描结束后休眠让路，捕获当前 playhead 用于检测变化唤醒。
-        // wait_for 周期从 200ms 缩短到 100ms + 播放头变化立即唤醒: 拖动 playhead 后
-        // 缩略图 backfill 可在 ~100ms 内感知变化重排,避免拖动期间铺底滞后于拖动位置。
+        // 本轮扫描结束后休眠让路。播放/暂停/拖动态都持续构建缩略图缓存；
+        // 100ms 足够感知 playhead 变化，同时避免完成后忙轮询。
         {
             std::unique_lock<std::mutex> lock(mu_);
-            const double lastPlayhead = playheadSec_;
-            cv_.wait_for(lock, 100ms, [this, lastPlayhead] {
-                return stopped_ || thumbnailStop_ ||
-                       std::abs(playheadSec_ - lastPlayhead) > 0.01;
+            cv_.wait_for(lock, 100ms, [this] {
+                return stopped_ || thumbnailStop_;
             });
             if (stopped_ || thumbnailStop_) break;
         }
@@ -1105,9 +1545,14 @@ void OfflineSession::ThumbnailBackfillRun() {
 }
 
 void OfflineSession::SetImageSubscription(const std::string& channel, bool enabled) {
+    // 【锁序】先 decodeMu_ 再通道锁/mu_。先拿 exclusive 状态锁时，正在解码的任务会
+    // 先释放 shared_lock；因此这里再取通道锁不会与解码任务形成交叉等待。
+    std::lock_guard<std::shared_mutex> dlock(decodeMu_);
+    auto [it, inserted] = imageDecodeLocks_.try_emplace(
+        channel, std::make_unique<std::mutex>());
+    (void)inserted;
+    std::lock_guard<std::mutex> channelLock(*it->second);
     std::lock_guard<std::mutex> lock(mu_);
-    // 订阅集/解码器/缓存受 decodeMu_ 保护(发帧线程锁外解码时持有它)。
-    std::lock_guard<std::mutex> dlock(decodeMu_);
     if (enabled) {
         subscribedImages_.insert(channel);
         // 惰性创建该通道的 HEVC 解码器；已存在则复用（保留参考帧状态）。
@@ -1117,6 +1562,10 @@ void OfflineSession::SetImageSubscription(const std::string& channel, bool enabl
             imageDecoders_.emplace(
                 channel, std::make_unique<viz::image::HevcDecoder>(channel));
         }
+        // 预创建状态节点，使多通道并行解码时不会并发修改 std::map 结构。
+        thumbnailDecoders_.emplace(
+            channel, std::make_unique<viz::image::HevcDecoder>(channel));
+        (void)thumbnailDone_[channel];
     } else {
         subscribedImages_.erase(channel);
         imageDecoders_.erase(channel);  // 释放解码器；重新订阅时从 I 帧重建
@@ -1124,6 +1573,7 @@ void OfflineSession::SetImageSubscription(const std::string& channel, bool enabl
         // 【闭环增量判据】清 lastFedLogTimeNs_，防止取消订阅重订时陈旧连续判据
         // 误命中增量单帧直解（解码器已重建为新实例，DPB 是空的，需从 I 帧开始）。
         lastFedLogTimeNs_.erase(channel);
+        imageWindows_.erase(channel);
         ClearDecodedImages(channel);
     }
     // 唤醒 BigDataRun：暂停态订阅变更后前端可能不再上报 playhead，
@@ -1131,26 +1581,43 @@ void OfflineSession::SetImageSubscription(const std::string& channel, bool enabl
     cv_.notify_all();
 }
 
+void OfflineSession::SetImageDeliveryMode(viz::transport::ImageDeliveryMode mode) {
+    imageDeliveryMode_.store(mode, std::memory_order_release);
+    if (mode == viz::transport::ImageDeliveryMode::Original) {
+        ClearDecodedImages();
+    }
+    // 唤醒两条大数据线程，使其立即进入新质量路径（暂停态切换尤其需要）。
+    cv_.notify_all();
+}
+
 void OfflineSession::SetPointCloudSubscription(const std::string& channel, bool enabled) {
     // 点云订阅集受 decodeMu_ 保护（发帧线程锁外注入时持有它，与图像同）。
+    // 【锁序】先 decodeMu_ 再 mu_（与 BigDataRun 一致）。
+    std::lock_guard<std::shared_mutex> dlock(decodeMu_);
     std::lock_guard<std::mutex> lock(mu_);
-    std::lock_guard<std::mutex> dlock(decodeMu_);
     if (enabled) {
         subscribedPointClouds_.insert(channel);
     } else {
         subscribedPointClouds_.erase(channel);
     }
+    hasInlineSubscription_.store(
+        !subscribedPointClouds_.empty() || !subscribedRawData_.empty(),
+        std::memory_order_relaxed);
     cv_.notify_all();  // 唤醒工作线程（点云订阅参与 Run 线程 wait 谓词）
 }
 
 void OfflineSession::SetRawDataSubscription(const std::string& channel, bool enabled) {
+    // 【锁序】先 decodeMu_ 再 mu_（与 BigDataRun 一致）。
+    std::lock_guard<std::shared_mutex> dlock(decodeMu_);
     std::lock_guard<std::mutex> lock(mu_);
-    std::lock_guard<std::mutex> dlock(decodeMu_);
     if (enabled) {
         subscribedRawData_.insert(channel);
     } else {
         subscribedRawData_.erase(channel);
     }
+    hasInlineSubscription_.store(
+        !subscribedPointClouds_.empty() || !subscribedRawData_.empty(),
+        std::memory_order_relaxed);
     cv_.notify_all();  // 唤醒 BigDataRun（同 SetImageSubscription）
 }
 
@@ -1320,10 +1787,11 @@ void OfflineSession::Run() {
         // 而非 sleep + 解码之和。
         viz::Frame outFrame;
         bool haveOut = false;
-        {
-            std::lock_guard<std::mutex> dlock(decodeMu_);
-            // 图像已迁出内联路径,改由 BigDataRun 依 playhead 前瞻解码走独立流下发;
-            // 内联发帧仅保留点云几何与 RawData(迁移期兼容)。
+        // 【关键】仅当存在点云/RawData 内联订阅时才持 decodeMu_。图像订阅不在此路径，
+        // 若无条件加锁，播放线程会与 BigDataRun 的长耗时图像解码串行，几何供帧被拖死
+        // （实测：订阅 1 路相机后几何供帧 25fps → 3.8~11fps）。
+        if (hasInlineSubscription_.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::shared_mutex> dlock(decodeMu_);
             const bool anySub = !subscribedPointClouds_.empty() ||
                                 !subscribedRawData_.empty();
             if (adapter_ && anySub) {
@@ -1346,7 +1814,7 @@ void OfflineSession::Run() {
             const uint64_t seq = (generation << 32) | static_cast<uint64_t>(frameIdx);
             sink_->SendFrame(seq, haveOut ? outFrame : *frame);
             // [perf-diag] 播放供帧进度：每 50 帧打印一次，定位播放线程是否在推进 frameIndex_。
-            if (frameIdx % 50 == 0) {
+            if (viz::DebugEnabled() && frameIdx % 50 == 0) {
                 std::cerr << "[viz_ffi][play] frameIdx=" << frameIdx
                           << "/" << meta_.frameCount
                           << " t=" << frame->t()

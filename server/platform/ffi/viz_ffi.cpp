@@ -17,6 +17,7 @@
 #include <string>
 
 #include "viz/config.h"
+#include "viz/debug.h"
 #include "viz/frame.h"
 #include "viz/transport/transport.h"
 #include "session/offline_session.h"
@@ -150,14 +151,23 @@ public:
     }
 
     // 大数据独立流帧(图像/RawData，type 11)。封包复用 EncodeBigDataFrame，与前端字节级一致。
-    // 进程内直连队列无界，故与预取帧共用在途水位背压：超高水位则丢弃本帧(丢旧不重试)返回 false。
+    // Desktop Original 模式要求“实时解码→立即上屏”，这里不与 type9 预取共享背压水位：
+    // 几何预取有完整文件的持续字节量，若和图像共用 64MB 水位，预取可把水位顶满后
+    // 令图像帧被静默丢弃，前端表现为“先出几帧然后永久不动”。图像源头已有
+    // kDecodedImageQueueCapacity=32 / per-channel backlog=4 的有界实时队列，UI 也只取
+    // 最新一帧，因此本机直连可以安全地按最新帧继续推送。
     bool SendBigDataFrame(const std::string& channel, double tSec, uint32_t gen,
                           uint8_t kind, uint32_t seq, const std::string& payload) override {
-        if (inflightBytes_.load(std::memory_order_acquire) >= kHighWatermarkBytes) {
-            return false;  // 丢旧不重试
+        // kind=0 是图像实时帧。桌面端绕过预取水位；RawData 仍保留水位，避免面板
+        // 快速滚动时把 IPC 队列撑爆。
+        if (kind != 0 &&
+            inflightBytes_.load(std::memory_order_acquire) >= kHighWatermarkBytes) {
+            return false;  // 非实时图像流：丢旧不重试
         }
         const std::string buf = viz::EncodeBigDataFrame(channel, tSec, gen, kind, seq, payload);
-        inflightBytes_.fetch_add(buf.size(), std::memory_order_release);
+        if (kind != 0) {
+            inflightBytes_.fetch_add(buf.size(), std::memory_order_release);
+        }
         emit(buf);
         return true;
     }
@@ -194,7 +204,7 @@ private:
 
     VizFfiMessageCallback cb_ = nullptr;
     void* ctx_ = nullptr;
-    // 在途(已下发但前端尚未确认消费)的预取帧字节数。仅预取路径参与背压统计。
+    // 在途(已下发但前端尚未确认消费)的预取帧字节数。仅预取/RawData路径参与背压统计。
     std::atomic<uint64_t> inflightBytes_{0};
     // 背压高水位:在途预取字节达到此值即拒发,交由预取线程退避。64MB 足够填满
     // 解码流水线又不至于撑爆内存(纯 layers 帧下约数百帧余量)。
@@ -215,11 +225,18 @@ struct VizFfiSession {
 
 extern "C" {
 
+void viz_ffi_set_debug(int enabled) {
+    viz::SetDebugEnabled(enabled != 0);
+}
+
 VizFfiSession* viz_ffi_session_create(VizFfiMessageCallback on_message, void* ctx) {
     if (!on_message) return nullptr;
     auto* handle = new VizFfiSession();
     handle->sink = std::make_unique<FfiSink>(on_message, ctx);
     handle->session = std::make_unique<viz::session::OfflineSession>(handle->sink.get());
+    // Desktop 进程内直连没有网络瓶颈：只保留原图独立流，同时关闭缩略图铺底双解码。
+    handle->session->SetImageDeliveryMode(
+        viz::transport::ImageDeliveryMode::Original);
     return handle;
 }
 

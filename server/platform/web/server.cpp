@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "viz/config.h"
+#include "viz/debug.h"
 #include "viz/frame.h"
 #include "viz/access/data_access_adapter.h"
 #include "viz/transport/transport.h"
@@ -75,6 +76,9 @@ public:
         : server_(server), hdl_(std::move(hdl)), allowedRoot_(std::move(allowedRoot)) {
         // 会话层经 IFrameSink(this) 回调下发帧/元信息/场景配置/错误。
         session_ = std::make_unique<viz::session::OfflineSession>(this);
+        // 前后端分离部署默认跨网络传输：只下发缩略图独立流，避免多路原图打满带宽。
+        session_->SetImageDeliveryMode(
+            viz::transport::ImageDeliveryMode::Thumbnail);
     }
 
     ~WsTransport() override { stop(); }
@@ -457,7 +461,26 @@ public:
 }  // namespace
 
 int main(int argc, char** argv) {
-    const uint16_t port = argc > 1 ? static_cast<uint16_t>(std::stoul(argv[1])) : 8080;
+    // 仅 Debug 模式输出性能诊断（image_*.csv / 逐帧日志）；打包/生产默认关闭。
+    if (viz::DebugArgEnabled(argc, argv)) viz::SetDebugEnabled(true);
+    // 端口取首个纯数字参数（--debug 之后仍可传 8080），缺省 8080。
+    uint16_t port = 8080;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i] || argv[i][0] == '\0') continue;
+        bool numeric = true;
+        for (const char* p = argv[i]; *p; ++p) {
+            if (*p < '0' || *p > '9') { numeric = false; break; }
+        }
+        if (numeric) {
+            try {
+                port = static_cast<uint16_t>(std::stoul(argv[i]));
+            } catch (...) { /* 保留默认端口 */ }
+            break;
+        }
+    }
+    if (viz::DebugEnabled()) {
+        std::cerr << "[viz] debug mode on: image_*.csv 与逐帧诊断日志将输出\n";
+    }
     const auto dataRoot = std::filesystem::temp_directory_path() / "filament-viz-upload";
     std::filesystem::create_directories(dataRoot);
     Server server;

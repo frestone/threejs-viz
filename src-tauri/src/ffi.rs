@@ -40,6 +40,8 @@ extern "C" {
     #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_session_create(on_message: RawCallback, ctx: *mut c_void) -> VizFfiSessionPtr;
     #[cfg(not(viz_ffi_stubs))]
+    fn viz_ffi_set_debug(enabled: c_int);
+    #[cfg(not(viz_ffi_stubs))]
     fn viz_ffi_session_destroy(session: VizFfiSessionPtr);
 
     #[cfg(not(viz_ffi_stubs))]
@@ -97,6 +99,9 @@ mod stubs {
     ) -> *mut c_void {
         std::ptr::null_mut()
     }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn viz_ffi_set_debug(_enabled: c_int) {}
 
     #[no_mangle]
     pub unsafe extern "C" fn viz_ffi_session_destroy(_session: *mut c_void) {}
@@ -169,6 +174,7 @@ mod stubs {
 pub(crate) fn ensure_linked() {
     std::hint::black_box((
         viz_ffi_session_create as *const () as usize,
+        viz_ffi_set_debug as *const () as usize,
         viz_ffi_session_destroy as *const () as usize,
         viz_ffi_open as *const () as usize,
         viz_ffi_seek as *const () as usize,
@@ -219,6 +225,12 @@ unsafe impl Send for VizSession {}
 unsafe impl Sync for VizSession {}
 
 impl VizSession {
+    /// 设置 C++ 后端 Debug 模式（仅 Debug 模式输出性能诊断 CSV/逐帧日志）。
+    /// 应在创建会话前调用；由宿主启动入口解析 VIZ_DEBUG / --debug 后传入。
+    pub fn set_debug(enabled: bool) {
+        unsafe { viz_ffi_set_debug(enabled as c_int) };
+    }
+
     /// 创建会话并登记下行回调。回调将在 C++ 会话线程被调用(已 panic 隔离)。
     /// 失败(C++ 侧返回 NULL,例如回调为空)时返回 None。
     pub fn create(handler: MessageHandler) -> Option<Self> {

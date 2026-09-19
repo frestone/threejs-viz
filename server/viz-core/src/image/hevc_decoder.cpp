@@ -4,6 +4,7 @@
 // -----------------------------------------------------------------------------
 #include "viz/image/hevc_decoder.h"
 
+#include <chrono>
 #include <iostream>
 
 #include "viz/image/jpeg_thumbnail.h"
@@ -40,6 +41,7 @@ HevcDecoder::HevcDecoder(std::string channel) : channel_(std::move(channel)) {}
 
 HevcDecoder::~HevcDecoder() {
     FreeReusable();
+    for (AVFrame* f : pendingFrames_) av_frame_free(&f);
     if (frame_) av_frame_free(&frame_);
     if (pkt_) av_packet_free(&pkt_);
     if (decoderCtx_) avcodec_free_context(&decoderCtx_);
@@ -68,6 +70,10 @@ bool HevcDecoder::Init() {
         std::cerr << "[hevc] alloc context failed for " << channel_ << std::endl;
         return false;
     }
+    // 多路相机已经按通道并行。这里再打开 FFmpeg 内部帧/切片线程，避免单路
+    // HEVC 帧耗时长时间超过 33ms；thread_count=0 表示交给 FFmpeg 自动选择。
+    decoderCtx_->thread_count = 0;
+    decoderCtx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     if (avcodec_open2(decoderCtx_, codec, nullptr) < 0) {
         std::cerr << "[hevc] avcodec_open2 failed for " << channel_ << std::endl;
         avcodec_free_context(&decoderCtx_);
@@ -86,7 +92,33 @@ bool HevcDecoder::Init() {
 
 void HevcDecoder::Flush() {
     if (decoderCtx_) avcodec_flush_buffers(decoderCtx_);
+    for (AVFrame* f : pendingFrames_) av_frame_free(&f);
+    pendingFrames_.clear();
     synced_ = false;
+}
+
+// 取走当前已就绪的全部输出帧。调用方之后按 FIFO 消费，避免解码器输出队列
+// 积压导致下一次 send_packet 返回 EAGAIN。
+void HevcDecoder::DrainOutputFrames() {
+    if (!decoderCtx_ || !frame_) return;
+    while (true) {
+        const int recvRet = avcodec_receive_frame(decoderCtx_, frame_);
+        if (recvRet < 0) {
+            if (recvRet != AVERROR(EAGAIN) && recvRet != AVERROR_EOF) {
+                std::cerr << "[hevc] receive failed for " << channel_
+                          << ": " << recvRet << std::endl;
+            }
+            break;
+        }
+        AVFrame* out = av_frame_alloc();
+        if (!out || av_frame_ref(out, frame_) < 0) {
+            av_frame_free(&out);
+            av_frame_unref(frame_);
+            break;
+        }
+        pendingFrames_.push_back(out);
+        av_frame_unref(frame_);
+    }
 }
 
 // 喂一包 -> 取一帧。返回的 AVFrame 由调用方 av_frame_free。
@@ -112,25 +144,36 @@ AVFrame* HevcDecoder::DecodeFrameInternal(const uint8_t* data, int size) {
     pkt_->data = const_cast<uint8_t*>(data);
     pkt_->size = size;
 
-    int sendRet = avcodec_send_packet(decoderCtx_, pkt_);
+    int sendRet = 0;
+    while (true) {
+        sendRet = avcodec_send_packet(decoderCtx_, pkt_);
+        if (sendRet != AVERROR(EAGAIN)) break;
+        // EAGAIN 表示还有旧输出未被取走。先补齐输出再重试送包；若一直不能
+        // 成功送包，旧实现会在下一次调用继续 EAGAIN，表现为整路图像卡死。
+        DrainOutputFrames();
+        if (pendingFrames_.empty()) break;
+    }
     if (sendRet < 0) {
-        // 送包失败(极少见):不改变同步态,交由上层重试/等下一 I 帧。
+        if (sendRet != AVERROR_EOF) {
+            std::cerr << "[hevc] send failed for " << channel_
+                      << ": " << sendRet << std::endl;
+        }
+        DrainOutputFrames();
+        if (!pendingFrames_.empty()) {
+            AVFrame* out = pendingFrames_.front();
+            pendingFrames_.pop_front();
+            return out;
+        }
         return nullptr;
     }
-    int recvRet = avcodec_receive_frame(decoderCtx_, frame_);
-    if (recvRet < 0) {
+    DrainOutputFrames();
+    if (pendingFrames_.empty()) {
         // reorder delay 下首个 I 帧 receive 可能 EAGAIN:此帧无输出但已送包,
         // synced_ 已置(见上),后续 P 帧会继续送入,不会花屏。
         return nullptr;
     }
-
-    // 拷贝一份,避免下次 receive 覆盖 frame_ 内部缓冲。
-    AVFrame* out = av_frame_alloc();
-    if (!out) return nullptr;
-    if (av_frame_ref(out, frame_) < 0) {
-        av_frame_free(&out);
-        return nullptr;
-}
+    AVFrame* out = pendingFrames_.front();
+    pendingFrames_.pop_front();
     return out;
 }
 
@@ -207,11 +250,13 @@ bool HevcDecoder::EnsureEncoder(int w, int h) {
 
 bool HevcDecoder::DecodeToJpeg(const uint8_t* data, int size,
                                std::vector<uint8_t>* outJpeg, int* outW, int* outH,
-                               int dstW, int dstH) {
+                               int dstW, int dstH, StageTiming* timing) {
     if (!outJpeg || !outW || !outH) return false;
+    const auto tStart = std::chrono::steady_clock::now();
 
     AVFrame* decoded = DecodeFrameInternal(data, size);
     if (!decoded) return false;
+    const auto tDecoded = std::chrono::steady_clock::now();
 
     const int srcW = decoded->width;
     const int srcH = decoded->height;
@@ -231,6 +276,7 @@ bool HevcDecoder::DecodeToJpeg(const uint8_t* data, int size,
     sws_scale(sws_, decoded->data, decoded->linesize, 0, srcH,
               yuv_->data, yuv_->linesize);
     av_frame_free(&decoded);
+    const auto tScaled = std::chrono::steady_clock::now();
 
     if (!EnsureEncoder(srcW, srcH)) return false;
 
@@ -255,6 +301,16 @@ bool HevcDecoder::DecodeToJpeg(const uint8_t* data, int size,
         *outJpeg = std::move(sourceJpeg);
         *outW = srcW;
         *outH = srcH;
+    }
+    if (timing) {
+        const auto tEnd = std::chrono::steady_clock::now();
+        const auto us = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+        };
+        timing->decodeUs = us(tStart, tDecoded);
+        timing->scaleUs = us(tDecoded, tScaled);
+        timing->encodeUs = us(tScaled, tEnd);
     }
     return true;
 }

@@ -15,6 +15,7 @@
 // 依赖:FFmpeg(avcodec/avutil/swscale),经 rules_foreign_cc 源码编译静态链接。
 // -----------------------------------------------------------------------------
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,13 @@ namespace viz::image {
 
 class HevcDecoder {
 public:
+    // 单帧解码各阶段耗时（微秒），用于定位 HEVC 解码 / 色彩缩放 / JPEG 编码占比。
+    struct StageTiming {
+        uint64_t decodeUs = 0;  // HEVC 解码（含 reorder 等待）
+        uint64_t scaleUs = 0;   // swscale 像素格式/尺寸转换
+        uint64_t encodeUs = 0;  // MJPEG 编码（+ 可选缩略图重编码）
+    };
+
     // channel 仅用于日志标识(如 camera360_front_image)。
     explicit HevcDecoder(std::string channel);
     ~HevcDecoder();
@@ -47,7 +55,8 @@ public:
     // 成功返回 true;解码失败/需丢弃返回 false(outJpeg 不保证有效)。
     bool DecodeToJpeg(const uint8_t* data, int size,
                       std::vector<uint8_t>* outJpeg, int* outW, int* outH,
-                      int dstW = 0, int dstH = 0);
+                      int dstW = 0, int dstH = 0,
+                      StageTiming* timing = nullptr);
 
     // 重置解码器参考帧状态。码流不连续(seek/丢帧)后必须调用,否则花屏。
     void Flush();
@@ -59,6 +68,9 @@ public:
 private:
     // 内部:喂一包并取出解码后的 AVFrame(调用方负责 av_frame_free)。失败返回 nullptr。
     AVFrame* DecodeFrameInternal(const uint8_t* data, int size);
+    // 取走解码器中所有已就绪输出帧。避免 frame-threading 的 reorder/EAGAIN 状态
+    // 阻塞下一次 avcodec_send_packet，造成后续整路图像永久无输出。
+    void DrainOutputFrames();
 
     // 按当前帧尺寸/源像素格式惰性(重)建 swscale 上下文与目标 YUV 帧;源尺寸/格式
     // 与目标尺寸不变时复用,避免每帧 sws_getContext/av_frame_get_buffer 的重复开销。
@@ -73,6 +85,9 @@ private:
     AVCodecContext* decoderCtx_ = nullptr;  // HEVC 解码上下文
     AVPacket* pkt_ = nullptr;
     AVFrame* frame_ = nullptr;
+    // 解码器已输出但尚未被上层消费的帧。正常单线程解码为空；当 FFmpeg 因
+    // reorder/threading 暂时无输出时保留一帧，下一次喂包先补齐输出。
+    std::deque<AVFrame*> pendingFrames_;
     bool inited_ = false;
     bool synced_ = false;  // 是否已处理过 I 帧(未同步前丢弃 P 帧防花屏)
 

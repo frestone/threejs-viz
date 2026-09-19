@@ -80,6 +80,16 @@ cc_binary(
     deps = [":viz_ffi_lib"],
 )
 
+# Desktop 原图链路 headless 复现/验收工具：模拟前端 playhead 上报并统计
+# BIGDATA(kind=0) 图像帧，用于区分 C++ 会话链路与 Tauri/React 前端问题。
+cc_binary(
+    name = "ffi_image_smoke",
+    srcs = ["ffi_image_smoke_main.cpp"],
+    includes = ["../.."],
+    copts = ["-std=c++17"],
+    deps = [":viz_ffi_lib"],
+)
+
 cc_test(
     name = "viz_ffi_contract_test",
     srcs = ["viz_ffi_contract_test.cpp"],
