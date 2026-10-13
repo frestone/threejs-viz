@@ -13,6 +13,11 @@ export class FfiTransport implements Transport {
   private connecting = false;
   private invokeFn: Invoke | null = null;
   private attempts = new ConnectionAttempt();
+  // 【连接前命令队列】引擎构造（stream.connect()）到 ffi_connect 完成之间存在窗口期：
+  // 此时 createEngine 已返回，上层可能立刻下发 open / subscribeImage / setPaused 等命令。
+  // 早期实现在未连接时直接 return 丢弃，导致这些命令永久丢失——表现为"文件打不开/
+  // 相机图像永不出图"，且前端无任何报错。改为按序暂存，连接建立后补发。
+  private pending: Array<{ command: string; args?: Record<string, unknown> }> = [];
 
   constructor(private handlers: TransportHandlers = {}) {}
 
@@ -62,6 +67,8 @@ export class FfiTransport implements Transport {
       }
       this.connected = true;
       this.connecting = false;
+      // 补发连接窗口期内被暂存的命令（顺序保持：先于 onOpen 下发的先执行）。
+      this.flushPending();
       this.handlers.onOpen?.();
     } catch (error) {
       this.connecting = false;
@@ -172,14 +179,31 @@ export class FfiTransport implements Transport {
     this.attempts.cancel();
     this.connected = false;
     this.connecting = false;
+    this.pending = [];
     if (this.invokeFn) void this.invokeFn("ffi_close").catch(() => undefined);
     if (wasConnected) this.handlers.onClose?.();
   }
 
   private call(command: string, args?: Record<string, unknown>): void {
-    if (!this.invokeFn || !this.connected) return;
+    // 连接尚未建立：暂存而非丢弃，待 ffi_connect 完成后按序补发（见 pending 字段说明）。
+    if (!this.connected || !this.invokeFn) {
+      this.pending.push({ command, args });
+      return;
+    }
     void this.invokeFn(command, args).catch((error) => {
       this.handlers.onError?.(error instanceof Error ? error : new Error(String(error)));
     });
+  }
+
+  // 连接建立后按序补发暂存命令。invokeFn 在 initialize 早期即已赋值，此处必然可用。
+  private flushPending(): void {
+    if (!this.invokeFn || this.pending.length === 0) return;
+    const queued = this.pending;
+    this.pending = [];
+    for (const { command, args } of queued) {
+      void this.invokeFn(command, args).catch((error) => {
+        this.handlers.onError?.(error instanceof Error ? error : new Error(String(error)));
+      });
+    }
   }
 }

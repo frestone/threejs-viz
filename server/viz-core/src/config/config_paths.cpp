@@ -76,6 +76,26 @@ std::string resolveConfigPath(const std::string& path) {
         }
     }
 
+#if defined(__APPLE__)
+    // 2b) macOS .app 打包形态：tauri 的 bundle.resources 把 configs 放到
+    //     threeJs_VIZ.app/Contents/Resources/configs/，而可执行文件位于
+    //     threeJs_VIZ.app/Contents/MacOS/ —— 与 configs 不同级。
+    //     【缺这条回退的后果】打包版从 /Applications 启动时 cwd 既不是项目根也没有
+    //     exe 同级 configs/，decoder.json 解析失败 → 静默回退内置默认值（该默认值
+    //     不含 imageChannels）→ 前端收到空的 IMAGE_DEFS → 相机面板无任何通道、
+    //     所有相机（含前视）图像永不显示，且无任何报错提示。
+    //     开发态 `tauri dev` / `tauri run` 因 build.rs 会把 configs 拷到 target/<profile>/
+    //     与可执行文件同级而恰好命中第 2 条，故该缺陷只在打包产物上暴露。
+    if (!dir.empty()) {
+        const std::string res = dir + "/../Resources/" + path;
+        if (isRegularFile(res)) {
+            std::cerr << "[config] '" << path << "' 未在 cwd/exe 目录找到，改用 app bundle "
+                         "Resources 目录: " << res << std::endl;
+            return res;
+        }
+    }
+#endif
+
     // 3) deb 安装形态：configs 装到 /usr/bin/configs。
     const std::string deb = "/usr/bin/" + path;
     if (isRegularFile(deb)) {

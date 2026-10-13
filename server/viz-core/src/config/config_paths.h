@@ -11,6 +11,10 @@
 //   1) 原样（cwd 相对）——保持现有 server/ 开发行为，兼容 VIZ_DECODER_CONFIG
 //   2) <exe_dir>/<path> —— 桌面二进制同目录（build.rs 会把 server/configs 复制
 //      到 target/<profile>/configs）
+//   2b) <exe_dir>/../Resources/<path> —— macOS .app 打包形态（tauri bundle.resources
+//      把 configs 装到 Contents/Resources/configs，与 Contents/MacOS 下的可执行文件
+//      不同级）。缺这条会让打包版永远读不到 decoder.json → 回退内置默认值
+//      （不含 imageChannels）→ 相机面板为空、所有相机图像都不显示。
 //   3) /usr/bin/<path> —— deb 安装形态（tauri.conf.json bundle 把
 //      resources/configs 装到 /usr/bin/configs）
 // 绝对路径或候选均不存在时原样返回（保留调用方原有的"不可读"报错路径）。
