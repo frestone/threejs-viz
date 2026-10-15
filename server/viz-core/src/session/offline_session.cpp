@@ -1742,6 +1742,16 @@ void OfflineSession::EmitStreamInfoLocked() {
     viz::Frame mapFrame;
     if (adapter_->ReadStaticMap(mapFrame)) {
         sink_->SendStaticMap(generation_ << 32, mapFrame);
+    } else if (meta_.lightMapMode) {
+        // 【非静默】轻图模式下拿不到静态地图，就是「轻图不渲染」的直接原因；旧实现此处
+        // 什么都不发，前端只表现为「图层面板里地图项都在、3D 场景空无一物」且零报错，
+        // 极难定位。这里显式上报，让该故障在界面上直接可见。
+        // 典型成因：light_map 未启用（配置解析失败回退内置默认值，见
+        // McapAdapter::makeSourceFrom），或该 MCAP 确实没有 /map/lite_definition_map。
+        sink_->SendError(
+            "轻图模式已启用，但未生成静态地图。请确认 configs/decoder_lightmap.json "
+            "可读（其 decoder.light_map.enabled 须为 true），或该 MCAP 是否真的包含 "
+            "/map/lite_definition_map 消息。");
     }
 }
 

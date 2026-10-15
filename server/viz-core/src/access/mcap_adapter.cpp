@@ -108,11 +108,42 @@ static std::string loadTextFrom(const std::string& path) {
                        std::istreambuf_iterator<char>());
 }
 
-viz::McapDataSource McapAdapter::makeSourceFrom(const std::string& decoderPath) const {
+viz::McapDataSource McapAdapter::makeSourceFrom(
+    const std::string& decoderPath,
+    const std::unordered_set<std::string>& topics) const {
     const std::string text = loadTextFrom(decoderPath);
     if (text.empty()) {
+        // 【静默退化链】配置文件不可读 -> 退到内置 ROVER 默认值。默认值里 light_map 的
+        // 字段号/topic/图层名全部已是现网约定值（见 data_source.h LightMapLayer），
+        // 唯一为 false 的是 enabled —— 也就是说「轻图能不能画出来」完全押在这一个
+        // 布尔量是否被配置文件打开。
+        // 【后果】打包版一旦解析不到 configs/decoder_lightmap.json：
+        //   buildIndex 不把 /map/lite_definition_map 加进 TopicFilter
+        //   -> index.lightMap 恒空 -> assembleStaticMap 立即返回空帧
+        //   -> ReadStaticMap()==false -> 会话层一个字节都不发（type 10 从不出现）
+        //   -> 前端 renderStaticMap 永不调用，轻图图层永不创建，且【全程零报错】。
+        // 【兜底】这里改按「整包实际内容」重新判定，规则与 configs/data_profiles.json
+        // 的 ProfileRegistry 完全一致（light_map 命中 = 含 /map/lite_definition_map；
+        // 高精优先级更高 = 含 /localization/global_location 时仍以高精为准）。命中即
+        // 强制打开 light_map，使静态地图解析不再依赖配置文件是否可读。
         std::cerr << "[decoder] '" << decoderPath
                   << "' unreadable, using built-in ROVER defaults" << std::endl;
+        static constexpr const char* kLightMapProbeTopic = "/map/lite_definition_map";
+        static constexpr const char* kHighPrecisionProbeTopic =
+            "/localization/global_location";
+        const bool hasLightMapTopic = topics.count(kLightMapProbeTopic) > 0;
+        const bool hasHighPrecisionTopic =
+            topics.count(kHighPrecisionProbeTopic) > 0;
+        if (hasLightMapTopic && !hasHighPrecisionTopic) {
+            viz::McapDataSource::DecoderConfig decoder;  // 内建 ROVER 默认值
+            decoder.lightMap.enabled = true;
+            std::cerr << "[decoder] 整包含 " << kLightMapProbeTopic
+                      << " 且无高精定位：强制打开 light_map 解码（配置缺失兜底），"
+                         "地图将按内建 lane/boundary 字段路径解析"
+                      << std::endl;
+            return viz::McapDataSource{viz::McapDataSource::Topics{},
+                                       std::move(decoder)};
+        }
         return viz::McapDataSource{};
     }
     try {
@@ -193,7 +224,7 @@ bool McapAdapter::openLocal(const std::string& path) {
         std::cerr << "[access] listTopics failed: " << e.what() << std::endl;
     }
     const std::string decoderPath = detectDecoderPath(topics);
-    viz::McapDataSource src = makeSourceFrom(decoderPath);
+    viz::McapDataSource src = makeSourceFrom(decoderPath, topics);
     scene_ = loadSceneConfigFrom(decoderPath);
     auto index = src.buildIndex(*reader, path);
     if (!index || index->frameCount() == 0) {
@@ -232,7 +263,7 @@ bool McapAdapter::openS3(const std::string& source) {
         std::cerr << "[access] listTopics(S3) failed: " << e.what() << std::endl;
     }
     const std::string decoderPath = detectDecoderPath(topics);
-    viz::McapDataSource src = makeSourceFrom(decoderPath);
+    viz::McapDataSource src = makeSourceFrom(decoderPath, topics);
     scene_ = loadSceneConfigFrom(decoderPath);
     auto index = src.buildIndex(*reader, bucket + "/" + key);
     if (!index || index->frameCount() == 0) {

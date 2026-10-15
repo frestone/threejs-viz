@@ -72,6 +72,20 @@ fn ffi_connect(
     .ok_or_else(|| "创建 FFI 会话失败".to_string())?;
 
     *guard = Some(session);
+
+    // VIZ_AUTO_OPEN=<绝对路径>：会话建立后立即打开该 MCAP，无需 GUI 交互。
+    // 用于无头复现/排查（配合 VIZ_DEBUG=1 把后端与前端诊断日志汇聚到 stderr），
+    // 与既有 VIZ_DEBUG / VIZ_PERF_LOG / VIZ_DECODER_CONFIG 同属诊断开关，默认不生效。
+    // 必须在会话登记之后调用：此时 Tauri Channel 已绑定，初始化阶段下发的一批配置
+    // （type 7/6/8/12/2/10）才不会丢失。
+    if let Ok(path) = std::env::var("VIZ_AUTO_OPEN") {
+        if !path.is_empty() {
+            if let Some(session) = guard.as_ref() {
+                eprintln!("[viz_ffi] VIZ_AUTO_OPEN 自动打开: {path}");
+                session.open(&path);
+            }
+        }
+    }
     Ok(())
 }
 

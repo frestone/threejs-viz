@@ -86,7 +86,11 @@ private:
     // A3b 落地后此处改为委托 ProfileRegistry::Select；当前沿用现有高精/轻图探测规则。
     std::string detectDecoderPath(
         const std::unordered_set<std::string>& topics) const;
-    viz::McapDataSource makeSourceFrom(const std::string& decoderPath) const;
+    // topics 用于「配置不可读」时的兜底判定：若整包实际含轻图地图 topic 而无高精定位，
+    // 则强制打开 light_map 解码（见实现内注释），避免配置缺失导致轻图静默不渲染。
+    viz::McapDataSource makeSourceFrom(
+        const std::string& decoderPath,
+        const std::unordered_set<std::string>& topics) const;
     viz::SceneConfig loadSceneConfigFrom(const std::string& decoderPath) const;
 
     std::shared_ptr<viz::McapDataSource::FrameIndex> index_;

@@ -1048,6 +1048,8 @@ export { SceneRenderer };
 // 【方案A·纯内存缓存】换新文件(open/openByName/openRecord/uploadFile)或换包时经 clearCache()
 // 清空内存缓存(cache.length = 0)并自增 cacheGeneration 作废在途解码，确保「换包全清」不串数据。
 // 不再有任何 IndexedDB 落盘/删库动作——全部帧仅驻留内存。
+// 例外：同一文件内的末尾回绕走 clearCache(true)，只清帧缓存、保留常驻轻图静态地图
+// （后端 type 10 仅在 Open 阶段下发一次，不会重发）。
 
 // 在未缓存 seek 的目标帧回填完成前，playhead 必须停留在目标位置，确保高清流收到
 // 正确的目标时间；普通播放才允许按当前缓存末尾封顶。
@@ -1291,7 +1293,11 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
     onPanelUpdate: (s) => opts.onRawDataPanelUpdate?.(s),
   });
 
-  const clearCache = () => {
+  // keepStaticMap=true 用于「同一文件内的回绕/复位」：此时地图几何完全没变，而后端
+  // 只在 Open 阶段经 EmitStreamInfoLocked 下发一次 type 10（SendStaticMap 全局唯一
+  // 调用点），seek/回绕都不会重发。若这里跟着把常驻地图清掉，轻图就会永久消失——
+  // 旧行为即「播到末尾再点播放，地图直接没了」。
+  const clearCache = (keepStaticMap = false) => {
     cache.length = 0;
     frameBytes.length = 0;
     cacheBytes = 0;
@@ -1302,7 +1308,7 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
     cacheGeneration++;
     // 【方案C·静态地图】换文件/重开流会清缓存,此时也清掉常驻静态地图,
     // 避免旧地图与新流地图叠加。新流 EmitStreamInfoLocked 会重发 type 10 地图。
-    scene.clearStaticMap();
+    if (!keepStaticMap) scene.clearStaticMap();
     // 【大数据流】换文件/重开流清缓存时同步清空大数据当前帧并 revoke blobUrl，
     // 避免旧流图像残留到新流。代次自增亦会丢弃在途旧代次大数据帧。
     bigDataStore.clear();
@@ -1316,6 +1322,32 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
 
   // 【方案A·全量常驻】不再有"seek 后裁掉过期帧"的 trimCacheBefore：整包帧常驻内存,
   // 任意已缓存位置都能立即命中渲染(拖动实时预览)。裁剪仅由 insertFrame 尾部 OOM 硬安全阀兜底。
+
+  // 【轻图无图看门狗】dataMode 为 lightmap 时，后端本应在会话建立阶段经独立通道下发
+  // 一次 type 10 静态地图。若迟迟收不到，说明后端 light_map 未启用（典型成因：
+  // configs/decoder_lightmap.json 不可读，回退到 lightMap.enabled=false 的内置默认值），
+  // 或该 MCAP 根本没有 /map/lite_definition_map 消息。
+  // 旧行为是后端「一个字节都不发」、前端「什么都不显示」——表现为图层面板里地图项都在、
+  // 3D 场景却空无一物，且全程零报错，极难定位。这里在超时后给出可操作的显式提示。
+  let lightMapWatchdog: ReturnType<typeof setTimeout> | null = null;
+  const clearLightMapWatchdog = () => {
+    if (lightMapWatchdog !== null) {
+      clearTimeout(lightMapWatchdog);
+      lightMapWatchdog = null;
+    }
+  };
+  const armLightMapWatchdog = () => {
+    clearLightMapWatchdog();
+    lightMapWatchdog = setTimeout(() => {
+      lightMapWatchdog = null;
+      if (dataMode !== "lightmap") return;
+      opts.onStatus?.(
+        "轻图模式已启用，但未收到静态地图（type 10）：请确认 configs/decoder_lightmap.json " +
+          "可读且 decoder.light_map.enabled 为 true，或该 MCAP 是否真的含 /map/lite_definition_map。",
+        true
+      );
+    }, 8000);
+  };
 
   const handlers: TransportHandlers = {
     onOpen: () => {
@@ -1338,6 +1370,9 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
       lastInfoGeneration = info.generation;
       time = 0;
       clearCache();
+      // 新流建立即按数据模式布防：轻图模式等 type 10 静态地图，等不到则显式告警。
+      if (dataMode === "lightmap") armLightMapWatchdog();
+      else clearLightMapWatchdog();
       paused = false;
       lastTick = performance.now();
       stream.send({ type: "setPaused", paused: false });
@@ -1413,6 +1448,24 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
         .then((frame) => {
           if (disposed || gen !== cacheGeneration) return;
           scene.renderStaticMap(frame.layers);
+          // 地图已到并渲染，撤销看门狗，避免误报。
+          clearLightMapWatchdog();
+          // Debug 模式下留一行可核验记录。打包版没有 GUI 自动化手段时，这是确认
+          // 「轻图确实完成了解码+渲染」的唯一可靠依据（ffi_log 在非 Debug 模式为空操作）。
+          if (isDebugEnabled()) {
+            const names = Object.keys(frame.layers);
+            let items = 0;
+            for (const layer of Object.values(frame.layers)) items += layer.items.length;
+            void import("@tauri-apps/api/core")
+              .then(({ invoke }) =>
+                invoke("ffi_log", {
+                  line:
+                    `[viz-map] 静态地图已渲染: layers=${names.length} items=${items} ` +
+                    `[${names.join(",")}]`,
+                })
+              )
+              .catch(() => undefined);
+          }
         })
         .catch((error) => {
           opts.onStatus?.(error instanceof Error ? error.message : "解码静态地图失败", true);
@@ -1648,9 +1701,11 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
   return {
     setPaused(value) {
       // 末尾再次点播放先回绕到起点（对齐 bug1 修复）。
+      // 回绕属于「同一文件内的复位」：帧缓存要清（从头重播），但常驻静态地图必须保留
+      // ——后端只在 Open 时下发一次 type 10，seek(0) 不会重发，跟着清掉轻图就永久消失。
       if (value === false && duration > 0 && time >= duration - 1e-3) {
         time = 0;
-        clearCache();
+        clearCache(true);
         stream.seek(0);
       }
       paused = value;
@@ -1792,6 +1847,7 @@ export async function createThreeEngine(opts: ThreeEngineOptions): Promise<Engin
       // 也会持续占用主线程、阻止浏览器进入 idle,并保留 stream/scene 等闭包引用
       // 阻碍 GC。必须在 close 之前 cancel,避免 dispose 后再触一次 advance。
       if (advanceRaf) cancelAnimationFrame(advanceRaf);
+      clearLightMapWatchdog();
       stream.close();
       decoderPool.dispose();
       // RawData decoder Worker terminate + reject pending（错误隔离，不影响其余 dispose）。
